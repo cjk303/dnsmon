@@ -1,0 +1,27 @@
+# Global settings
+global:
+  scrape_interval: 15s       # How often to scrape targets
+  evaluation_interval: 15s   # How often to evaluate rules
+
+# Optional alert rule files (you can add later)
+rule_files:
+  # - "alert.rules"
+
+scrape_configs:
+  # Scrape the Prometheus server itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Scrape the custom Python BIND exporter
+  - job_name: 'bind_exporter'
+    scrape_interval: 15s
+    metrics_path: /
+    static_configs:
+      - targets:
+        - 'BIND_SERVER_IP:9119'  # Replace with your BIND server's IP
+
+  # (Optional) Another job for testing multiple exporters
+  # - job_name: 'another_service'
+  #   static_configs:
+  #     - targets: ['server2.example.com:PORT']
