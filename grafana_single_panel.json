@@ -1,151 +1,163 @@
 {
-  "annotations": {
-    "list": []
-  },
+  "id": null,
+  "uid": "bind-monitor",
+  "title": "BIND DNS Monitoring",
+  "tags": ["bind", "dns", "prometheus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
   "panels": [
     {
+      "type": "row",
+      "title": "Service Health",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
       "type": "stat",
-      "title": "BIND Service Status",
-      "datasource": "Prometheus",
-      "targets": [
-        {
-          "expr": "bind_up",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": ["last"],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center"
-      },
+      "title": "BIND Service Up",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "targets": [{ "expr": "bind_up", "refId": "A" }],
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
-            ]
-          },
-          "mappings": [
-            { "type": "value", "options": { "0": { "text": "DOWN" }, "1": { "text": "UP" } } }
-          ]
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 }
+          "unit": "none",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": 0 },
+            { "color": "green", "value": 1 }
+          ]}
+        }
+      }
     },
     {
-      "type": "time_series",
-      "title": "Total Queries",
-      "datasource": "Prometheus",
-      "targets": [
-        { "expr": "bind_queries_total", "refId": "A" }
-      ],
-      "gridPos": { "h": 8, "w": 8, "x": 4, "y": 0 }
+      "type": "stat",
+      "title": "Resolver Health",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "targets": [{ "expr": "bind_resolver_health", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": 0 },
+            { "color": "green", "value": 1 }
+          ]}
+        }
+      }
     },
     {
-      "type": "time_series",
-      "title": "Query Failures",
-      "datasource": "Prometheus",
-      "targets": [
-        { "expr": "bind_query_failures_total", "refId": "A" }
-      ],
-      "gridPos": { "h": 8, "w": 8, "x": 12, "y": 0 }
+      "type": "row",
+      "title": "Performance",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
     },
     {
-      "type": "gauge",
+      "type": "timeSeries",
+      "title": "Queries per Second",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "targets": [{ "expr": "rate(bind_queries_total[1m])", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "qps",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green" },
+            { "color": "yellow", "value": 1000 },
+            { "color": "red", "value": 5000 }
+          ]}
+        }
+      }
+    },
+    {
+      "type": "timeSeries",
+      "title": "Query Latency (s)",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "targets": [{ "expr": "bind_query_latency_seconds", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 0.05 },
+            { "color": "red", "value": 0.2 }
+          ]}
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Errors",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 }
+    },
+    {
+      "type": "timeSeries",
+      "title": "Query Failures per Second",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 13 },
+      "targets": [{ "expr": "rate(bind_query_failures_total[1m])", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "qps",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green" },
+            { "color": "yellow", "value": 1 },
+            { "color": "red", "value": 5 }
+          ]}
+        }
+      }
+    },
+    {
+      "type": "timeSeries",
+      "title": "Security Events per Second",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 13 },
+      "targets": [{ "expr": "rate(bind_security_events_total[1m])", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "qps",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green" },
+            { "color": "yellow", "value": 1 },
+            { "color": "red", "value": 5 }
+          ]}
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Accuracy & BGP VIP Difference",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 }
+    },
+    {
+      "type": "stat",
       "title": "Record Accuracy (%)",
-      "datasource": "Prometheus",
-      "targets": [
-        { "expr": "bind_record_accuracy", "refId": "A" }
-      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 20 },
+      "targets": [{ "expr": "bind_record_accuracy_ratio * 100", "refId": "A" }],
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "min": 0,
-          "max": 100,
-          "thresholds": {
-            "mode": "percentage",
-            "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "orange", "value": 70 },
-              { "color": "green", "value": 90 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": ["last"],
-          "fields": "",
-          "values": false
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": 0 },
+            { "color": "yellow", "value": 90 },
+            { "color": "green", "value": 99 }
+          ]}
         }
-      },
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 4 }
-    },
-    {
-      "type": "time_series",
-      "title": "Query Latency (s)",
-      "datasource": "Prometheus",
-      "targets": [
-        { "expr": "bind_latency_seconds", "refId": "A" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "s" },
-        "overrides": []
-      },
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 4 }
-    },
-    {
-      "type": "time_series",
-      "title": "Security Failures",
-      "datasource": "Prometheus",
-      "targets": [
-        { "expr": "bind_security_failures_total", "refId": "A" }
-      ],
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 4 }
+      }
     },
     {
       "type": "stat",
-      "title": "Direct vs BGP VIP Difference",
-      "datasource": "Prometheus",
-      "targets": [
-        { "expr": "bind_direct_vs_bgp_difference", "refId": "A" }
-      ],
-      "options": {
-        "reduceOptions": { "calcs": ["last"] },
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center"
-      },
+      "title": "VIP vs Direct Diff (%)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 20 },
+      "targets": [{ "expr": "bind_vip_query_diff_ratio * 100", "refId": "A" }],
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": 0 },
-              { "color": "red", "value": 1 }
-            ]
-          },
-          "mappings": [
-            { "type": "value", "options": { "0": { "text": "MATCH" }, "1": { "text": "DIFFER" } } }
-          ]
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 18, "y": 0 }
+          "unit": "percent",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": 0 },
+            { "color": "yellow", "value": 5 },
+            { "color": "red", "value": 20 }
+          ]}
+        }
+      }
     }
   ],
-  "schemaVersion": 30,
-  "title": "BIND DNS Exporter Dashboard",
-  "version": 1,
-  "refresh": "10s",
-  "time": { "from": "now-15m", "to": "now" }
+  "templating": { "list": [] }
 }
