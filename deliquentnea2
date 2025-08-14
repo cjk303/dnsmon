@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========== CONFIGURATION ===========
+TENANT="epiqglobal"
+HOSTNAME="${TENANT}.delinea.app"
+TOKEN_URL="https://${HOSTNAME}/identity/api/oauth2/token/xpmplatform"
+SCOPE="xpmheadless"
+
+CLIENT_ID="YOUR_CLIENT_ID"
+CLIENT_SECRET="YOUR_CLIENT_SECRET"
+
+# =========== REQUEST TOKEN ===========
+echo "Requesting access token from Delinea..."
+token_response=$(curl --silent --location \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=${SCOPE}" \
+  --data-urlencode "client_id=${CLIENT_ID}" \
+  --data-urlencode "client_secret=${CLIENT_SECRET}" \
+  "${TOKEN_URL}")
+
+access_token=$(echo "${token_response}" | jq --raw-output '.access_token')
+
+if [[ -z "${access_token}" || "${access_token}" == "null" ]]; then
+  echo "Failed to obtain access token"
+  echo "${token_response}"
+  exit 1
+fi
+
+echo "Access token acquired."
+
+# =========== LIST ALL ACCOUNTS ===========
+echo "Listing all accounts in Secret Server..."
+accounts_response=$(curl --silent --location \
+  --header "Authorization: Bearer ${access_token}" \
+  "https://${HOSTNAME}/api/v1/accounts")
+
+echo "${accounts_response}" | jq .
