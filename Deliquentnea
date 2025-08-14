@@ -2,21 +2,19 @@
 set -euo pipefail
 
 # ==== CONFIG ====
-TENANT="epiqglobal"  # Change if different
-USERNAME="your.username@domain.com"
-PASSWORD="yourpassword"
-CLIENT_ID="your-client-id"
-CLIENT_SECRET="your-client-secret"
+TENANT="epiqglobal"             # Your tenant prefix (before .delinea.app)
+CLIENT_ID="api-user-client-id"  # OAuth application client_id linked to the API user
+CLIENT_SECRET="api-user-secret" # OAuth application client_secret
+SCOPE="system"                  # Scope to request (system gives full API access if allowed)
 
 TOKEN_URL="https://${TENANT}.delinea.app/SecretServer/oauth2/token"
 
 # ==== REQUEST TOKEN ====
+echo "Requesting token for API user with scope: $SCOPE"
 response=$(curl -s -X POST "$TOKEN_URL" \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  --data-urlencode "grant_type=password" \
-  --data-urlencode "username=${USERNAME}" \
-  --data-urlencode "password=${PASSWORD}" \
-  --data-urlencode "scope=system" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=${SCOPE}" \
   --data-urlencode "client_id=${CLIENT_ID}" \
   --data-urlencode "client_secret=${CLIENT_SECRET}"
 )
@@ -29,7 +27,7 @@ echo "$response" | jq .
 ACCESS_TOKEN=$(echo "$response" | jq -r '.access_token // empty')
 
 if [[ -z "$ACCESS_TOKEN" ]]; then
-  echo "❌ Failed to obtain access token — check username/password, client credentials, or scope permissions."
+  echo "❌ Failed to obtain access token — check client ID/secret, API user permissions, or scope settings."
   exit 1
 fi
 
