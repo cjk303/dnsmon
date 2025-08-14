@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========== CONFIGURATION ===========
+
+TENANT="epiqglobal"
+HOSTNAME="${TENANT}.delinea.app"
+TOKEN_URL="https://${HOSTNAME}/identity/api/oauth2/token/xpmplatform"
+
+CLIENT_ID="YOUR_CLIENT_ID"
+CLIENT_SECRET="YOUR_CLIENT_SECRET"
+SCOPE="xpmheadless"
+
+# =========== REQUEST TOKEN ===========
+
+# Make the token request
+echo "Requesting access token from Delinea..."
+token_response=$(curl --silent --location \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=${SCOPE}" \
+  --data-urlencode "client_id=${CLIENT_ID}" \
+  --data-urlencode "client_secret=${CLIENT_SECRET}" \
+  "${TOKEN_URL}")
+
+# Extract tokens using jq
+access_token=$(echo "${token_response}" | jq --raw-output '.access_token')
+refresh_token=$(echo "${token_response}" | jq --raw-output '.refresh_token // empty')
+
+echo "Access Token:"
+echo "${access_token}"
+
+if [[ -n "${refresh_token}" ]]; then
+  echo "Refresh Token:"
+  echo "${refresh_token}"
+fi
