@@ -1,36 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========== CONFIGURATION ===========
+# ==== CONFIG ====
+TENANT="epiqglobal"  # Change if different
+USERNAME="your.username@domain.com"
+PASSWORD="yourpassword"
+CLIENT_ID="your-client-id"
+CLIENT_SECRET="your-client-secret"
 
-TENANT="epiqglobal"
-HOSTNAME="${TENANT}.delinea.app"
-TOKEN_URL="https://${HOSTNAME}/identity/api/oauth2/token/xpmplatform"
+TOKEN_URL="https://${TENANT}.delinea.app/SecretServer/oauth2/token"
 
-CLIENT_ID="YOUR_CLIENT_ID"
-CLIENT_SECRET="YOUR_CLIENT_SECRET"
-SCOPE="xpmheadless"
-
-# =========== REQUEST TOKEN ===========
-
-# Make the token request
-echo "Requesting access token from Delinea..."
-token_response=$(curl --silent --location \
-  --header "Content-Type: application/x-www-form-urlencoded" \
-  --data-urlencode "grant_type=client_credentials" \
-  --data-urlencode "scope=${SCOPE}" \
+# ==== REQUEST TOKEN ====
+response=$(curl -s -X POST "$TOKEN_URL" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=password" \
+  --data-urlencode "username=${USERNAME}" \
+  --data-urlencode "password=${PASSWORD}" \
+  --data-urlencode "scope=system" \
   --data-urlencode "client_id=${CLIENT_ID}" \
-  --data-urlencode "client_secret=${CLIENT_SECRET}" \
-  "${TOKEN_URL}")
+  --data-urlencode "client_secret=${CLIENT_SECRET}"
+)
 
-# Extract tokens using jq
-access_token=$(echo "${token_response}" | jq --raw-output '.access_token')
-refresh_token=$(echo "${token_response}" | jq --raw-output '.refresh_token // empty')
+# ==== DEBUG OUTPUT ====
+echo "Raw response:"
+echo "$response" | jq .
 
-echo "Access Token:"
-echo "${access_token}"
+# ==== EXTRACT TOKEN ====
+ACCESS_TOKEN=$(echo "$response" | jq -r '.access_token // empty')
 
-if [[ -n "${refresh_token}" ]]; then
-  echo "Refresh Token:"
-  echo "${refresh_token}"
+if [[ -z "$ACCESS_TOKEN" ]]; then
+  echo "❌ Failed to obtain access token — check username/password, client credentials, or scope permissions."
+  exit 1
 fi
+
+echo
+echo "✅ Access token:"
+echo "$ACCESS_TOKEN"
