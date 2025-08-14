@@ -10,7 +10,8 @@ SCOPE="xpmheadless"
 CLIENT_ID="YOUR_CLIENT_ID"
 CLIENT_SECRET="YOUR_CLIENT_SECRET"
 
-PAGE_SIZE=50
+SECRET_NAME="SVI_T1_PAM_SvrOps_15"
+SECRET_DOMAIN="amer.epiqcorp.com"
 
 # =========== GET ACCESS TOKEN ===========
 echo "Requesting access token..."
@@ -32,41 +33,35 @@ fi
 
 echo "Access token acquired."
 
-# =========== GET ALL SECRETS ===========
-echo "Fetching all secrets..."
+# =========== FIND SECRET BY NAME ===========
+echo "Searching for secret '${SECRET_NAME}' in domain '${SECRET_DOMAIN}'..."
 
-page=1
-while true; do
-  secrets_response=$(curl --silent --location \
-    --header "Authorization: Bearer ${access_token}" \
-    "https://${HOSTNAME}/api/v1/secrets?page=${page}&pageSize=${PAGE_SIZE}")
+search_response=$(curl --silent --location \
+  --header "Authorization: Bearer ${access_token}" \
+  "https://${HOSTNAME}/api/v1/secrets?filter.name=${SECRET_NAME}&filter.domainName=${SECRET_DOMAIN}")
 
-  secret_count=$(echo "${secrets_response}" | jq '.records | length')
+secret_id=$(echo "${search_response}" | jq -r '.records[0].id // empty')
 
-  if [[ "${secret_count}" -eq 0 ]]; then
-    break
-  fi
+if [[ -z "${secret_id}" ]]; then
+  echo "No matching secret found or no permission to view."
+  echo "${search_response}" | jq .
+  exit 1
+fi
 
-  # Loop over each secret
-  echo "${secrets_response}" | jq -c '.records[]' | while read -r secret; do
-    secret_id=$(echo "${secret}" | jq -r '.id')
-    secret_name=$(echo "${secret}" | jq -r '.name')
+echo "Found secret ID: ${secret_id}"
 
-    echo "Secret ID: ${secret_id} | Name: ${secret_name}"
+# =========== GET SECRET PASSWORD ===========
+echo "Retrieving password..."
 
-    # Fetch account details for this secret
-    accounts=$(curl --silent --location \
-      --header "Authorization: Bearer ${access_token}" \
-      "https://${HOSTNAME}/api/v1/secrets/${secret_id}/accounts")
+fields_response=$(curl --silent --location \
+  --header "Authorization: Bearer ${access_token}" \
+  "https://${HOSTNAME}/api/v1/secrets/${secret_id}/fields")
 
-    if [[ $(echo "${accounts}" | jq 'length') -gt 0 ]]; then
-      echo "${accounts}" | jq -r '.[] | "  Account Username: \(.username) | Domain: \(.domain // "N/A")"'
-    else
-      echo "  No accounts for this secret."
-    fi
-  done
+password=$(echo "${fields_response}" | jq -r '.[] | select(.slug=="password") | .value')
 
-  page=$((page+1))
-done
-
-echo "Done."
+if [[ -n "${password}" ]]; then
+  echo "Password: ${password}"
+else
+  echo "Password field not found or not accessible."
+  echo "${fields_response}" | jq .
+fi
