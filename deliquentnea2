@@ -10,8 +10,10 @@ SCOPE="xpmheadless"
 CLIENT_ID="YOUR_CLIENT_ID"
 CLIENT_SECRET="YOUR_CLIENT_SECRET"
 
-# =========== REQUEST TOKEN ===========
-echo "Requesting access token from Delinea..."
+PAGE_SIZE=50
+
+# =========== GET ACCESS TOKEN ===========
+echo "Requesting access token..."
 token_response=$(curl --silent --location \
   --header "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode "grant_type=client_credentials" \
@@ -20,20 +22,51 @@ token_response=$(curl --silent --location \
   --data-urlencode "client_secret=${CLIENT_SECRET}" \
   "${TOKEN_URL}")
 
-access_token=$(echo "${token_response}" | jq --raw-output '.access_token')
+access_token=$(echo "${token_response}" | jq -r '.access_token')
 
 if [[ -z "${access_token}" || "${access_token}" == "null" ]]; then
-  echo "Failed to obtain access token"
+  echo "Failed to obtain token:"
   echo "${token_response}"
   exit 1
 fi
 
 echo "Access token acquired."
 
-# =========== LIST ALL ACCOUNTS ===========
-echo "Listing all accounts in Secret Server..."
-accounts_response=$(curl --silent --location \
-  --header "Authorization: Bearer ${access_token}" \
-  "https://${HOSTNAME}/api/v1/accounts")
+# =========== GET ALL SECRETS ===========
+echo "Fetching all secrets..."
 
-echo "${accounts_response}" | jq .
+page=1
+while true; do
+  secrets_response=$(curl --silent --location \
+    --header "Authorization: Bearer ${access_token}" \
+    "https://${HOSTNAME}/api/v1/secrets?page=${page}&pageSize=${PAGE_SIZE}")
+
+  secret_count=$(echo "${secrets_response}" | jq '.records | length')
+
+  if [[ "${secret_count}" -eq 0 ]]; then
+    break
+  fi
+
+  # Loop over each secret
+  echo "${secrets_response}" | jq -c '.records[]' | while read -r secret; do
+    secret_id=$(echo "${secret}" | jq -r '.id')
+    secret_name=$(echo "${secret}" | jq -r '.name')
+
+    echo "Secret ID: ${secret_id} | Name: ${secret_name}"
+
+    # Fetch account details for this secret
+    accounts=$(curl --silent --location \
+      --header "Authorization: Bearer ${access_token}" \
+      "https://${HOSTNAME}/api/v1/secrets/${secret_id}/accounts")
+
+    if [[ $(echo "${accounts}" | jq 'length') -gt 0 ]]; then
+      echo "${accounts}" | jq -r '.[] | "  Account Username: \(.username) | Domain: \(.domain // "N/A")"'
+    else
+      echo "  No accounts for this secret."
+    fi
+  done
+
+  page=$((page+1))
+done
+
+echo "Done."
