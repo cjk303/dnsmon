@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========== CONFIGURATION ===========
+# ===== CONFIGURATION =====
 TENANT="epiqglobal"
 HOSTNAME="${TENANT}.delinea.app"
 TOKEN_URL="https://${HOSTNAME}/identity/api/oauth2/token/xpmplatform"
@@ -10,10 +10,11 @@ SCOPE="xpmheadless"
 CLIENT_ID="YOUR_CLIENT_ID"
 CLIENT_SECRET="YOUR_CLIENT_SECRET"
 
-SECRET_NAME="SVI_T1_PAM_SvrOps_15"
-SECRET_DOMAIN="amer.epiqcorp.com"
+FOLDER_NAME="Tier 1"
+TEMPLATE_NAME="Epiq Active Directory Account"
+SECRET_NAME="amer.epiqcorp.com\\SVI_T1_PAM_SvrOps_15"
 
-# =========== GET ACCESS TOKEN ===========
+# ===== GET ACCESS TOKEN =====
 echo "Requesting access token..."
 token_response=$(curl --silent --location \
   --header "Content-Type: application/x-www-form-urlencoded" \
@@ -26,42 +27,64 @@ token_response=$(curl --silent --location \
 access_token=$(echo "${token_response}" | jq -r '.access_token')
 
 if [[ -z "${access_token}" || "${access_token}" == "null" ]]; then
-  echo "Failed to obtain token:"
-  echo "${token_response}"
+  echo "Failed to obtain token."
   exit 1
 fi
-
 echo "Access token acquired."
 
-# =========== FIND SECRET BY NAME ===========
-echo "Searching for secret '${SECRET_NAME}' in domain '${SECRET_DOMAIN}'..."
-
-search_response=$(curl --silent --location \
+# ===== GET FOLDER ID =====
+echo "Looking up folder ID for '${FOLDER_NAME}'..."
+folder_resp=$(curl --silent --location \
   --header "Authorization: Bearer ${access_token}" \
-  "https://${HOSTNAME}/api/v1/secrets?filter.name=${SECRET_NAME}&filter.domainName=${SECRET_DOMAIN}")
+  "https://${HOSTNAME}/api/v1/folders?filter.name=${FOLDER_NAME}")
 
-secret_id=$(echo "${search_response}" | jq -r '.records[0].id // empty')
-
-if [[ -z "${secret_id}" ]]; then
-  echo "No matching secret found or no permission to view."
-  echo "${search_response}" | jq .
+folder_id=$(echo "${folder_resp}" | jq -r '.records[0].id // empty')
+if [[ -z "${folder_id}" ]]; then
+  echo "Folder '${FOLDER_NAME}' not found or no permission."
+  echo "${folder_resp}" | jq .
   exit 1
 fi
+echo "Folder ID: ${folder_id}"
 
-echo "Found secret ID: ${secret_id}"
+# ===== GET TEMPLATE ID =====
+echo "Looking up template ID for '${TEMPLATE_NAME}'..."
+template_resp=$(curl --silent --location \
+  --header "Authorization: Bearer ${access_token}" \
+  "https://${HOSTNAME}/api/v1/secret-templates?filter.name=${TEMPLATE_NAME}")
 
-# =========== GET SECRET PASSWORD ===========
+template_id=$(echo "${template_resp}" | jq -r '.records[0].id // empty')
+if [[ -z "${template_id}" ]]; then
+  echo "Template '${TEMPLATE_NAME}' not found or no permission."
+  echo "${template_resp}" | jq .
+  exit 1
+fi
+echo "Template ID: ${template_id}"
+
+# ===== SEARCH FOR SECRET =====
+echo "Searching for secret '${SECRET_NAME}'..."
+secret_resp=$(curl --silent --location \
+  --header "Authorization: Bearer ${access_token}" \
+  "https://${HOSTNAME}/api/v1/secrets?filter.folderId=${folder_id}&filter.secretTemplateId=${template_id}&filter.name=${SECRET_NAME}")
+
+secret_id=$(echo "${secret_resp}" | jq -r '.records[0].id // empty')
+if [[ -z "${secret_id}" ]]; then
+  echo "Secret not found in folder '${FOLDER_NAME}' with given template."
+  echo "${secret_resp}" | jq .
+  exit 1
+fi
+echo "Found Secret ID: ${secret_id}"
+
+# ===== GET SECRET PASSWORD =====
 echo "Retrieving password..."
-
-fields_response=$(curl --silent --location \
+fields_resp=$(curl --silent --location \
   --header "Authorization: Bearer ${access_token}" \
   "https://${HOSTNAME}/api/v1/secrets/${secret_id}/fields")
 
-password=$(echo "${fields_response}" | jq -r '.[] | select(.slug=="password") | .value')
-
-if [[ -n "${password}" ]]; then
-  echo "Password: ${password}"
-else
-  echo "Password field not found or not accessible."
-  echo "${fields_response}" | jq .
+password=$(echo "${fields_resp}" | jq -r '.[] | select(.slug=="password") | .value')
+if [[ -z "${password}" ]]; then
+  echo "Password field not found or inaccessible."
+  echo "${fields_resp}" | jq .
+  exit 1
 fi
+
+echo "Password for '${SECRET_NAME}': ${password}"
