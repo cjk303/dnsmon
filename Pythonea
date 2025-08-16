@@ -1,0 +1,96 @@
+import requests
+
+# ------------- CONFIGURATION -------------
+tenant = "epiqglobal.delinea.app"  # your Delinea tenant URL (no protocol prefix)
+client_id = "YOUR_CLIENT_ID"
+client_secret = "YOUR_CLIENT_SECRET"
+
+# Scopes
+scope = "xpmheadless"
+
+# ------------- STEP 1: Get Access Token -------------
+token_url = f"https://{tenant}/identity/api/oauth2/token/xpmplatform"
+token_data = {
+    "grant_type": "client_credentials",
+    "client_id": client_id,
+    "client_secret": client_secret,
+    "scope": scope
+}
+token_headers = {
+    "Content-Type": "application/x-www-form-urlencoded"
+}
+
+resp = requests.post(token_url, data=token_data, headers=token_headers)
+resp.raise_for_status()
+token_response = resp.json()
+access_token = token_response.get("access_token")
+print("✅ Access token obtained.")
+
+# ------------- STEP 2: Get Secret Server URL -------------
+vaults_url = f"https://{tenant}/vaultbroker/api/vaults"
+vault_headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Content-Type": "application/json"
+}
+
+resp2 = requests.get(vaults_url, headers=vault_headers)
+resp2.raise_for_status()
+vaults = resp2.json().get("vaults", [])
+
+secret_server_url = None
+for vault in vaults:
+    if vault.get("isDefault") and vault["connection"].get("url"):
+        secret_server_url = vault["connection"]["url"].rstrip("/")
+        break
+
+if not secret_server_url:
+    raise Exception("❌ No default Secret Server URL found. Configure via platform settings or Vault Broker API.")
+
+print(f"✅ Secret Server base URL: {secret_server_url}")
+
+# ------------- STEP 3: Prompt for AD Username & Search Secrets -------------
+username = input("Enter the AD username (e.g., DOMAIN\\user or just user): ").strip()
+if not username:
+    raise Exception("❌ Username cannot be empty.")
+
+search_url = f"{secret_server_url}/api/v2/secrets?filter.searchText={username}"
+search_headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Content-Type": "application/json"
+}
+
+resp3 = requests.get(search_url, headers=search_headers)
+resp3.raise_for_status()
+results = resp3.json().get("records", [])
+
+if not results:
+    raise Exception(f"❌ No secrets found matching username: {username}")
+
+print(f"✅ Found {len(results)} matching secret(s).")
+
+# If multiple results, let user pick
+if len(results) > 1:
+    print("\nMultiple secrets found:")
+    for i, s in enumerate(results, start=1):
+        print(f"{i}. SecretId={s['id']} | Name={s['name']} | Folder={s.get('folderName','')}")
+    choice = int(input("Select the secret number to retrieve: ").strip())
+    selected = results[choice - 1]
+else:
+    selected = results[0]
+
+secret_id = selected["id"]
+print(f"✅ Selected SecretId={secret_id}, Name={selected['name']}")
+
+# ------------- STEP 4: Retrieve Secret Details -------------
+secret_api_url = f"{secret_server_url}/api/v2/secrets/{secret_id}"
+secret_headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Content-Type": "application/json"
+}
+
+resp4 = requests.get(secret_api_url, headers=secret_headers)
+resp4.raise_for_status()
+secret_details = resp4.json()
+
+print("✅ Secret details retrieved successfully:")
+print(secret_details)
