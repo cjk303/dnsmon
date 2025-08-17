@@ -5,7 +5,6 @@ tenant = "epiqglobal.delinea.app"  # your Delinea tenant URL (no protocol prefix
 client_id = "YOUR_CLIENT_ID"
 client_secret = "YOUR_CLIENT_SECRET"
 
-# Scopes
 scope = "xpmheadless"
 
 # ------------- STEP 1: Get Access Token -------------
@@ -16,22 +15,16 @@ token_data = {
     "client_secret": client_secret,
     "scope": scope
 }
-token_headers = {
-    "Content-Type": "application/x-www-form-urlencoded"
-}
+token_headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
 resp = requests.post(token_url, data=token_data, headers=token_headers)
 resp.raise_for_status()
-token_response = resp.json()
-access_token = token_response.get("access_token")
+access_token = resp.json().get("access_token")
 print("✅ Access token obtained.")
 
 # ------------- STEP 2: Get Secret Server URL -------------
 vaults_url = f"https://{tenant}/vaultbroker/api/vaults"
-vault_headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type": "application/json"
-}
+vault_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
 resp2 = requests.get(vaults_url, headers=vault_headers)
 resp2.raise_for_status()
@@ -44,53 +37,67 @@ for vault in vaults:
         break
 
 if not secret_server_url:
-    raise Exception("❌ No default Secret Server URL found. Configure via platform settings or Vault Broker API.")
+    raise Exception("❌ No default Secret Server URL found.")
 
 print(f"✅ Secret Server base URL: {secret_server_url}")
 
-# ------------- STEP 3: Prompt for AD Username & Search Secrets -------------
-username = input("Enter the AD username (e.g., DOMAIN\\user or just user): ").strip()
-if not username:
+# ------------- STEP 3: Prompt for AD Username -------------
+target_username = input("Enter the AD username you want to search for: ").strip().lower()
+if not target_username:
     raise Exception("❌ Username cannot be empty.")
 
-search_url = f"{secret_server_url}/api/v2/secrets?filter.searchText={username}"
-search_headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type": "application/json"
-}
+# ------------- STEP 4: Pull all secrets and filter by username field -------------
+page = 1
+page_size = 50
+matched_secrets = []
 
-resp3 = requests.get(search_url, headers=search_headers)
-resp3.raise_for_status()
-results = resp3.json().get("records", [])
+while True:
+    list_url = f"{secret_server_url}/api/v2/secrets?take={page_size}&skip={(page-1)*page_size}"
+    list_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    resp_list = requests.get(list_url, headers=list_headers)
+    resp_list.raise_for_status()
+    data = resp_list.json()
 
-if not results:
-    raise Exception(f"❌ No secrets found matching username: {username}")
+    secrets = data.get("records", [])
+    if not secrets:
+        break
 
-print(f"✅ Found {len(results)} matching secret(s).")
+    for s in secrets:
+        secret_id = s["id"]
+        secret_api_url = f"{secret_server_url}/api/v2/secrets/{secret_id}"
+        resp_secret = requests.get(secret_api_url, headers=list_headers)
+        if resp_secret.status_code != 200:
+            continue
+        secret_details = resp_secret.json()
 
-# If multiple results, let user pick
-if len(results) > 1:
-    print("\nMultiple secrets found:")
-    for i, s in enumerate(results, start=1):
-        print(f"{i}. SecretId={s['id']} | Name={s['name']} | Folder={s.get('folderName','')}")
-    choice = int(input("Select the secret number to retrieve: ").strip())
-    selected = results[choice - 1]
-else:
-    selected = results[0]
+        # Look for username field inside items
+        items = secret_details.get("items", [])
+        for field in items:
+            if field.get("fieldName", "").lower() == "username":
+                field_value = str(field.get("itemValue", "")).lower()
+                if target_username in field_value:
+                    matched_secrets.append({
+                        "id": secret_id,
+                        "name": secret_details.get("name"),
+                        "folder": secret_details.get("folderName"),
+                        "username": field_value
+                    })
+        # Optional: add other field types if needed
 
-secret_id = selected["id"]
-print(f"✅ Selected SecretId={secret_id}, Name={selected['name']}")
+    if len(secrets) < page_size:
+        break
+    page += 1
 
-# ------------- STEP 4: Retrieve Secret Details -------------
-secret_api_url = f"{secret_server_url}/api/v2/secrets/{secret_id}"
-secret_headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type": "application/json"
-}
+if not matched_secrets:
+    raise Exception(f"❌ No secrets found containing username: {target_username}")
 
-resp4 = requests.get(secret_api_url, headers=secret_headers)
-resp4.raise_for_status()
-secret_details = resp4.json()
+print(f"✅ Found {len(matched_secrets)} matching secret(s):")
+for i, s in enumerate(matched_secrets, start=1):
+    print(f"{i}. SecretId={s['id']} | Name={s['name']} | Folder={s.get('folder','')} | Username={s['username']}")
 
-print("✅ Secret details retrieved successfully:")
-print(secret_details)
+choice = int(input("Select the secret number to retrieve fully: ").strip())
+selected = matched_secrets[choice - 1]
+
+# ------------- STEP 5: Retrieve and Show Full Secret -------------
+secret_api_url = f"{secret_server_url}/api/v2/secrets/{selected['id']}"
+resp_full = reques_
