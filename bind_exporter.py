@@ -1,6 +1,4 @@
-Skip to content
-You said:
-Look through this prometheus exporter script 
+
 #!/usr/bin/env python3
 import time
 import socket
