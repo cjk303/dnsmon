@@ -1,4 +1,5 @@
 import requests
+import json
 
 # ------------- CONFIGURATION -------------
 tenant = "epiqglobal.delinea.app"
@@ -6,7 +7,14 @@ client_id = "YOUR_CLIENT_ID"
 client_secret = "YOUR_CLIENT_SECRET"
 scope = "xpmheadless"
 
+def pretty(data):
+    try:
+        return json.dumps(data, indent=2)
+    except:
+        return str(data)
+
 # ------------- STEP 1: Get Access Token -------------
+print("🔹 Requesting access token...")
 token_url = f"https://{tenant}/identity/api/oauth2/token/xpmplatform"
 token_data = {
     "grant_type": "client_credentials",
@@ -17,15 +25,22 @@ token_data = {
 token_headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
 resp = requests.post(token_url, data=token_data, headers=token_headers)
+print("Token Response Status:", resp.status_code)
+print("Raw Response:", resp.text, "\n")
+
 resp.raise_for_status()
 access_token = resp.json().get("access_token")
-print("✅ Access token obtained.")
+print("✅ Access token obtained.\n")
 
 # ------------- STEP 2: Get Secret Server URL -------------
+print("🔹 Retrieving Secret Server base URL...")
 vaults_url = f"https://{tenant}/vaultbroker/api/vaults"
 vault_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
 resp2 = requests.get(vaults_url, headers=vault_headers)
+print("Vaults Response Status:", resp2.status_code)
+print("Raw Vaults Response:", resp2.text, "\n")
+
 resp2.raise_for_status()
 vaults = resp2.json().get("vaults", [])
 
@@ -38,33 +53,38 @@ for vault in vaults:
 if not secret_server_url:
     raise Exception("❌ No default Secret Server URL found.")
 
-print(f"✅ Secret Server base URL: {secret_server_url}")
+print(f"✅ Secret Server base URL: {secret_server_url}\n")
 
-# ------------- STEP 3: List All Secrets Available -------------
-page = 1
-page_size = 50
-all_secrets = []
+# ------------- STEP 3: List Folders (Debug) -------------
+print("🔹 Checking folder visibility...")
+folders_url = f"{secret_server_url}/api/v2/folders"
+resp3 = requests.get(folders_url, headers={"Authorization": f"Bearer {access_token}"})
+print("Folders Response Status:", resp3.status_code)
+print("Raw Folders Response:", resp3.text, "\n")
 
-while True:
-    list_url = f"{secret_server_url}/api/v2/secrets?take={page_size}&skip={(page-1)*page_size}"
-    list_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    resp_list = requests.get(list_url, headers=list_headers)
-    resp_list.raise_for_status()
-    data = resp_list.json()
+# ------------- STEP 4: List Secrets (Debug) -------------
+print("🔹 Checking secret visibility (first page only)...")
+secrets_url = f"{secret_server_url}/api/v2/secrets?take=25&skip=0"
+resp4 = requests.get(secrets_url, headers={"Authorization": f"Bearer {access_token}"})
+print("Secrets Response Status:", resp4.status_code)
+print("Raw Secrets Response:", resp4.text, "\n")
 
-    secrets = data.get("records", [])
-    if not secrets:
-        break
+# ------------- STEP 5: Permissions Check -------------
+print("🔹 Checking effective permissions for this token...")
+permissions_url = f"{secret_server_url}/api/v2/permissions"
+resp5 = requests.get(permissions_url, headers={"Authorization": f"Bearer {access_token}"})
+print("Permissions Response Status:", resp5.status_code)
+print("Raw Permissions Response:", resp5.text, "\n")
 
-    all_secrets.extend(secrets)
-
-    if len(secrets) < page_size:
-        break
-    page += 1
-
-if not all_secrets:
-    print("❌ No secrets visible with this token.")
-else:
-    print(f"✅ Found {len(all_secrets)} secrets:")
-    for s in all_secrets:
-        print(f"ID={s['id']} | Name={s['name']} | Folder={s.get('folderName','')}")
+# ------------- STEP 6: Summary -------------
+if resp4.status_code == 200:
+    data = resp4.json()
+    records = data.get("records", [])
+    if records:
+        print(f"✅ Found {len(records)} secrets on first page:")
+        for s in records:
+            print(f"ID={s['id']} | Name={s['name']} | Folder={s.get('folderName','')}")
+    else:
+        print("⚠️ Token works, but no secrets are visible.")
+elif resp4.status_code == 403:
+    print("❌ Access denied to secrets. Likely a permissions issue. Check the output above from /api/v2/permissions.")
