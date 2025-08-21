@@ -25,7 +25,8 @@ DNS_EDNS_FRAGMENTED = Counter("dns_edns_fragmented_total", "Total fragmented EDN
 
 BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
 BIND_QUERIES_BY_TYPE = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
-BIND_QUERIES_BY_TRANSPORT = Gauge("bind_queries_by_transport_total", "DNS queries by transport", ["transport"])
+BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total TCP DNS queries")
+BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total UDP DNS queries")
 BIND_RESPONSES_BY_CODE = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
 BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
 BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
@@ -34,13 +35,10 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
-FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
-CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
-CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
 
-# NIC metrics using ifstat
-NIC_RX_KBYTES_PER_SEC = Gauge("system_nic_rx_kbytes_per_sec", "NIC receive rate in KB/s", ["nic"])
-NIC_TX_KBYTES_PER_SEC = Gauge("system_nic_tx_kbytes_per_sec", "NIC transmit rate in KB/s", ["nic"])
+# NIC metrics will be dynamically created
+NIC_RX = {}
+NIC_TX = {}
 
 # =========================
 # Configuration
@@ -102,10 +100,11 @@ def update_bind_stats():
             value = int(counter.text or 0)
             BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(value)
 
-        for counter in root.findall(".//counters[@type='transport']//counter"):
-            transport = counter.attrib.get("name")
-            value = int(counter.text or 0)
-            BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).set(value)
+        # TCP/UDP counts
+        tcp_count = int(root.findtext(".//counters[@type='transport']//counter[@name='TCP']") or 0)
+        udp_count = int(root.findtext(".//counters[@type='transport']//counter[@name='UDP']") or 0)
+        BIND_QUERIES_TCP.set(tcp_count)
+        BIND_QUERIES_UDP.set(udp_count)
 
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name")
@@ -129,43 +128,49 @@ def update_bind_stats():
 def update_system_metrics():
     CPU_UTIL.set(psutil.cpu_percent())
 
-    # FRR status
-    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
-
-    # Chronyd status and drift
-    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
+def update_nic_metrics():
     try:
-        result = subprocess.check_output(["chronyc", "tracking"], text=True)
-        for line in result.splitlines():
-            if line.strip().startswith("Last offset"):
-                drift = float(line.split()[-2])
-                CHRONYD_DRIFT.set(drift)
-    except Exception:
-        CHRONYD_DRIFT.set(0.0)
+        # Run ifstat for all ens* interfaces, 1 second interval, 1 sample
+        result = subprocess.check_output(
+            ["ifstat", "-b", "-i", "ens*", "1", "1"], text=True
+        )
+        lines = result.strip().splitlines()
+        if len(lines) < 3:
+            print("No NIC data from ifstat")
+            return
 
-    # NIC throughput using ifstat
-    try:
-        result = subprocess.run("ifstat -b -i ens* 1 1", shell=True, capture_output=True, text=True)
-        lines = result.stdout.strip().splitlines()
-        if len(lines) >= 3:
-            nics = lines[0].split()
-            rx_tx = lines[2].split()
-            for i, nic in enumerate(nics):
-                rx = float(rx_tx[i*2])
-                tx = float(rx_tx[i*2+1])
-                NIC_RX_KBYTES_PER_SEC.labels(nic=nic).set(rx)
-                NIC_TX_KBYTES_PER_SEC.labels(nic=nic).set(tx)
+        headers = lines[0].split()
+        values = lines[2].split()
+
+        for i, val in enumerate(values):
+            iface = headers[i // 2]
+            direction = "rx" if i % 2 == 0 else "tx"
+            try:
+                v = float(val)
+            except ValueError:
+                v = 0.0
+
+            if direction == "rx":
+                if iface not in NIC_RX:
+                    NIC_RX[iface] = Gauge(f"system_nic_{iface}_rx_kbytes_per_sec", f"RX KB/s for {iface}")
+                NIC_RX[iface].set(v)
+            else:
+                if iface not in NIC_TX:
+                    NIC_TX[iface] = Gauge(f"system_nic_{iface}_tx_kbytes_per_sec", f"TX KB/s for {iface}")
+                NIC_TX[iface].set(v)
+
     except Exception as e:
-        print(f"Error collecting NIC metrics: {e}")
+        print("Error connecting NIC metrics:", e)
 
 # =========================
 # Main Loop
 # =========================
 def main():
     start_http_server(9119, addr="0.0.0.0")
-    print("BIND exporter with NIC metrics started on :9119")
+    print("BIND + system + NIC exporter started on :9119")
 
     while True:
+        # BIND health
         BIND_UP.set(1 if check_bind_health() else 0)
 
         direct_result, direct_latency, direct_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
@@ -177,8 +182,8 @@ def main():
         else:
             accuracy = 0
             BIND_QUERY_FAILS.inc()
-
         BIND_RECORD_ACCURACY.set(accuracy)
+
         diff = 0 if direct_result and bgp_result and set(direct_result) == set(bgp_result) else 1
         BIND_DIRECT_VS_BGP.set(diff)
 
@@ -187,7 +192,9 @@ def main():
 
         BIND_QUERIES.inc()
 
+        # Update system and NIC metrics
         update_system_metrics()
+        update_nic_metrics()
         update_bind_stats()
 
         time.sleep(QUERY_INTERVAL)
