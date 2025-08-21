@@ -1,0 +1,31 @@
+{
+  "type": "timeseries",
+  "title": "BIND Queries by Transport",
+  "datasource": "Prometheus",
+  "targets": [
+    {
+      "expr": "bind_queries_by_transport_total{transport=\"udp\"}",
+      "legendFormat": "UDP",
+      "refId": "A"
+    },
+    {
+      "expr": "bind_queries_by_transport_total{transport=\"tcp\"}",
+      "legendFormat": "TCP",
+      "refId": "B"
+    }
+  ],
+  "fieldConfig": {
+    "defaults": {
+      "unit": "short"
+    }
+  },
+  "options": {
+    "tooltip": {
+      "mode": "all"
+    },
+    "legend": {
+      "displayMode": "list",
+      "placement": "bottom"
+    }
+  }
+}
