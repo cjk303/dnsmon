@@ -27,14 +27,14 @@ BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
 BIND_QUERIES_BY_TYPE = {}
 BIND_QUERIES_BY_TRANSPORT = {}
 BIND_RESPONSES_BY_CODE = {}
-BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
-BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
-BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
-BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
+BIND_AXFR_SUCCESSES = {}
+BIND_AXFR_FAILURES = {}
+BIND_SOA_REFRESH = {}
+BIND_SOA_EXPIRY = {}
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
-NIC_UTIL = Gauge("system_nic_utilization_percent", "NIC utilization percentage", ["nic"])
+NIC_UTIL = {}
 FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
 CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
@@ -50,9 +50,33 @@ QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/"
 EXPECTED_IPS = {"10.35.33.13"}  # Known correct IP(s)
 
+# Predefined known metrics
+KNOWN_QTYPES = ["A", "AAAA", "MX", "NS", "CNAME", "SOA", "PTR"]
+KNOWN_TRANSPORTS = ["udp", "tcp", "tcp-tls", "other"]
+KNOWN_RCODE = ["NOERROR", "NXDOMAIN", "SERVFAIL", "REFUSED", "FORMERR"]
+
 # =========================
-# Functions
+# Helper functions
 # =========================
+def init_dynamic_metrics():
+    for qtype in KNOWN_QTYPES:
+        BIND_QUERIES_BY_TYPE[qtype] = Gauge(
+            "bind_queries_by_type_total", "DNS queries by type", ["qtype"]
+        )
+        BIND_QUERIES_BY_TYPE[qtype].labels(qtype=qtype).set(0)
+
+    for transport in KNOWN_TRANSPORTS:
+        BIND_QUERIES_BY_TRANSPORT[transport] = Gauge(
+            "bind_queries_by_transport_total", "DNS queries by transport", ["transport"]
+        )
+        BIND_QUERIES_BY_TRANSPORT[transport].labels(transport=transport).set(0)
+
+    for rcode in KNOWN_RCODE:
+        BIND_RESPONSES_BY_CODE[rcode] = Gauge(
+            "bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"]
+        )
+        BIND_RESPONSES_BY_CODE[rcode].labels(rcode=rcode).set(0)
+
 def query_dns(server_ip, hostname, qtype):
     resolver = dns.resolver.Resolver()
     resolver.nameservers = [server_ip]
@@ -85,52 +109,63 @@ def check_bind_health():
         return False
 
 def update_bind_stats():
-    global BIND_QUERIES_BY_TYPE, BIND_QUERIES_BY_TRANSPORT, BIND_RESPONSES_BY_CODE
     try:
         r = requests.get(BIND_STATS_URL, timeout=3)
         root = ET.fromstring(r.text)
 
-        # Cache hit ratio
+        # Cache ratio
         hits = int(root.findtext(".//counters[@type='cache']//counter[@name='hits']") or 0)
         misses = int(root.findtext(".//counters[@type='cache']//counter[@name='misses']") or 0)
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # QTYPE metrics
+        # Queries by type
         for counter in root.findall(".//counters[@type='qtype']//counter"):
-            qtype = counter.attrib.get("name")
+            qtype = counter.attrib.get("name").upper()
             value = int(counter.text or 0)
             if qtype not in BIND_QUERIES_BY_TYPE:
-                BIND_QUERIES_BY_TYPE[qtype] = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
+                BIND_QUERIES_BY_TYPE[qtype] = Gauge(
+                    "bind_queries_by_type_total", "DNS queries by type", ["qtype"]
+                )
             BIND_QUERIES_BY_TYPE[qtype].labels(qtype=qtype).set(value)
 
-        # Transport metrics
+        # Queries by transport
         for counter in root.findall(".//counters[@type='transport']//counter"):
             transport = counter.attrib.get("name").lower()
             value = int(counter.text or 0)
             if transport not in BIND_QUERIES_BY_TRANSPORT:
-                BIND_QUERIES_BY_TRANSPORT[transport] = Gauge("bind_queries_by_transport_total", "DNS queries by transport", ["transport"])
+                BIND_QUERIES_BY_TRANSPORT[transport] = Gauge(
+                    "bind_queries_by_transport_total", "DNS queries by transport", ["transport"]
+                )
             BIND_QUERIES_BY_TRANSPORT[transport].labels(transport=transport).set(value)
 
-        # RCODE metrics
+        # Responses by RCODE
         for counter in root.findall(".//counters[@type='rcode']//counter"):
-            rcode = counter.attrib.get("name")
+            rcode = counter.attrib.get("name").upper()
             value = int(counter.text or 0)
             if rcode not in BIND_RESPONSES_BY_CODE:
-                BIND_RESPONSES_BY_CODE[rcode] = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
+                BIND_RESPONSES_BY_CODE[rcode] = Gauge(
+                    "bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"]
+                )
             BIND_RESPONSES_BY_CODE[rcode].labels(rcode=rcode).set(value)
 
-        # Zone metrics
+        # AXFR / SOA metrics
         for zone in root.findall(".//zones//zone"):
             zone_name = zone.attrib.get("name")
             axfr_success = int(zone.findtext("axfr-success") or 0)
             axfr_failure = int(zone.findtext("axfr-failure") or 0)
             refresh = int(zone.findtext("refresh") or 0)
             expiry = int(zone.findtext("expiry") or 0)
-            BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(axfr_success)
-            BIND_AXFR_FAILURES.labels(zone=zone_name).set(axfr_failure)
-            BIND_SOA_REFRESH.labels(zone=zone_name).set(refresh)
-            BIND_SOA_EXPIRY.labels(zone=zone_name).set(expiry)
+
+            for metric_dict, value, name in [
+                (BIND_AXFR_SUCCESSES, axfr_success, "bind_axfr_success_total"),
+                (BIND_AXFR_FAILURES, axfr_failure, "bind_axfr_failure_total"),
+                (BIND_SOA_REFRESH, refresh, "bind_soa_refresh_seconds"),
+                (BIND_SOA_EXPIRY, expiry, "bind_soa_expiry_seconds"),
+            ]:
+                if zone_name not in metric_dict:
+                    metric_dict[zone_name] = Gauge(name, name.replace("_", " "), ["zone"])
+                metric_dict[zone_name].labels(zone=zone_name).set(value)
 
     except Exception as e:
         print(f"Error fetching BIND stats: {e}")
@@ -138,14 +173,13 @@ def update_bind_stats():
 def update_system_metrics():
     CPU_UTIL.set(psutil.cpu_percent())
     for nic, stats in psutil.net_io_counters(pernic=True).items():
+        if nic not in NIC_UTIL:
+            NIC_UTIL[nic] = Gauge("system_nic_utilization_percent", "NIC utilization percentage", ["nic"])
         utilization = (stats.bytes_sent + stats.bytes_recv) / (1024 * 1024)
-        NIC_UTIL.labels(nic=nic).set(utilization)
+        NIC_UTIL[nic].labels(nic=nic).set(utilization)
 
-    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
-    FRR_STATUS.set(1 if frr_running else 0)
-
-    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
-    CHRONYD_STATUS.set(1 if chronyd_running else 0)
+    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
+    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
 
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True)
@@ -162,6 +196,8 @@ def update_system_metrics():
 def main():
     start_http_server(9119, addr="0.0.0.0")
     print("BIND exporter started on :9119")
+
+    init_dynamic_metrics()
 
     while True:
         BIND_UP.set(1 if check_bind_health() else 0)
