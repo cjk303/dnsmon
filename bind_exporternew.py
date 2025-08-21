@@ -32,18 +32,6 @@ BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfer
 BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
 BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
-# UDP/TCP query counters (from nsstat)
-UDP_QUERIES = Gauge('bind_queries_udp_total', 'Total number of UDP queries')
-TCP_QUERIES = Gauge('bind_queries_tcp_total', 'Total number of TCP queries')
-QUERY_SUCCESS = Gauge('bind_queries_success_total', 'Total successful queries')
-QUERY_FAILURE = Gauge('bind_queries_failure_total', 'Total failed queries')
-UDP_OPEN = Gauge('bind_udp_open_total', 'UDP sockets open')
-TCP_OPEN = Gauge('bind_tcp_open_total', 'TCP sockets open')
-UDP_CLOSE = Gauge('bind_udp_close_total', 'UDP sockets closed')
-TCP_CLOSE = Gauge('bind_tcp_close_total', 'TCP sockets closed')
-TCP_ACTIVE = Gauge('bind_tcp_active_total', 'TCP sockets active')
-UDP_ACTIVE = Gauge('bind_udp_active_total', 'UDP sockets active')
-
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
 NIC_UTIL = Gauge("system_nic_utilization_percent", "NIC utilization percentage", ["nic"])
@@ -59,8 +47,28 @@ DNS_TEST_TYPE = "A"
 DIRECT_DNS = "127.0.0.1"
 BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
-BIND_STATS_URL = "http://127.0.0.1:8053/xml/v3"
+BIND_STATS_URL = "http://127.0.0.1:8053/"
 EXPECTED_IPS = {"10.35.33.13"}  # Known correct IP(s)
+
+# =========================
+# Initialize metrics with default values
+# =========================
+def initialize_metrics():
+    BIND_UP.set(0)
+    BIND_LATENCY.set(0)
+    BIND_RECORD_ACCURACY.set(0)
+    BIND_DIRECT_VS_BGP.set(0)
+    BIND_QUERIES.inc(0)
+    BIND_QUERY_FAILS.inc(0)
+    BIND_SECURITY_ERRORS.inc(0)
+    BIND_TRUNCATED_PERCENT.set(0)
+    DNS_ANSWER_SIZE.set(0)
+    DNS_EDNS_FRAGMENTED.inc(0)
+    CPU_UTIL.set(0)
+    CHRONYD_DRIFT.set(0)
+    FRR_STATUS.set(0)
+    CHRONYD_STATUS.set(0)
+    BIND_CACHE_HIT_RATIO.set(0)
 
 # =========================
 # Functions
@@ -78,7 +86,7 @@ def query_dns(server_ip, hostname, qtype):
         DNS_ANSWER_SIZE.set(size)
         truncated = bool(getattr(answers.response, "flags", 0) & 0x200)  # TC flag
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
-        if size > 1400:
+        if size > 1400:  # threshold for fragmentation risk
             DNS_EDNS_FRAGMENTED.inc()
         return [str(rdata) for rdata in answers], latency, None
     except dns.resolver.NXDOMAIN:
@@ -101,31 +109,26 @@ def update_bind_stats():
         r = requests.get(BIND_STATS_URL, timeout=3)
         root = ET.fromstring(r.text)
 
-        # --- Cache stats ---
         hits = int(root.findtext(".//counters[@type='cache']//counter[@name='hits']") or 0)
         misses = int(root.findtext(".//counters[@type='cache']//counter[@name='misses']") or 0)
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # --- Query types ---
         for counter in root.findall(".//counters[@type='qtype']//counter"):
             qtype = counter.attrib.get("name")
             value = int(counter.text or 0)
             BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(value)
 
-        # --- Transport ---
         for counter in root.findall(".//counters[@type='transport']//counter"):
             transport = counter.attrib.get("name")
             value = int(counter.text or 0)
             BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).set(value)
 
-        # --- RCODEs ---
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name")
             value = int(counter.text or 0)
             BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(value)
 
-        # --- Zones ---
         for zone in root.findall(".//zones//zone"):
             zone_name = zone.attrib.get("name")
             axfr_success = int(zone.findtext("axfr-success") or 0)
@@ -137,31 +140,6 @@ def update_bind_stats():
             BIND_SOA_REFRESH.labels(zone=zone_name).set(refresh)
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(expiry)
 
-        # --- NSStat Counters ---
-        for counter in root.findall(".//counters[@type='nsstat']/counter"):
-            name = counter.attrib['name']
-            value = int(counter.text)
-            if name == "QryUDP":
-                UDP_QUERIES.set(value)
-            elif name == "QryTCP":
-                TCP_QUERIES.set(value)
-            elif name == "QrySuccess":
-                QUERY_SUCCESS.set(value)
-            elif name == "QryFailure":
-                QUERY_FAILURE.set(value)
-            elif name == "UDP4Open":
-                UDP_OPEN.set(value)
-            elif name == "TCP4Open":
-                TCP_OPEN.set(value)
-            elif name == "UDP4Close":
-                UDP_CLOSE.set(value)
-            elif name == "TCP4Close":
-                TCP_CLOSE.set(value)
-            elif name == "TCP4Active":
-                TCP_ACTIVE.set(value)
-            elif name == "UDP4Active":
-                UDP_ACTIVE.set(value)
-
     except Exception as e:
         print(f"Error fetching BIND stats: {e}")
 
@@ -171,14 +149,17 @@ def update_system_metrics():
         utilization = (stats.bytes_sent + stats.bytes_recv) / (1024 * 1024)
         NIC_UTIL.labels(nic=nic).set(utilization)
 
-    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
-    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
+    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
+    FRR_STATUS.set(1 if frr_running else 0)
+
+    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
+    CHRONYD_STATUS.set(1 if chronyd_running else 0)
 
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True)
         for line in result.splitlines():
             if line.strip().startswith("Last offset"):
-                drift = float(line.split()[-2])
+                drift = float(line.split()[-2])  # seconds
                 CHRONYD_DRIFT.set(drift)
     except Exception:
         CHRONYD_DRIFT.set(0.0)
@@ -187,6 +168,7 @@ def update_system_metrics():
 # Main Loop
 # =========================
 def main():
+    initialize_metrics()
     start_http_server(9119, addr="0.0.0.0")
     print("BIND exporter started on :9119")
 
@@ -202,8 +184,8 @@ def main():
         else:
             accuracy = 0
             BIND_QUERY_FAILS.inc()
-        BIND_RECORD_ACCURACY.set(accuracy)
 
+        BIND_RECORD_ACCURACY.set(accuracy)
         diff = 0 if direct_result and bgp_result and set(direct_result) == set(bgp_result) else 1
         BIND_DIRECT_VS_BGP.set(diff)
 
