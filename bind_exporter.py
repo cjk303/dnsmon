@@ -24,11 +24,11 @@ DNS_ANSWER_SIZE = Gauge('dns_answer_size_bytes', 'DNS answer size in bytes')
 DNS_EDNS_FRAGMENTED = Counter('dns_edns_fragmented_total', 'Total fragmented EDNS answers')
 
 BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
-BIND_QUERIES_BY_TYPE = Counter("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
-BIND_QUERIES_BY_TRANSPORT = Counter("bind_queries_by_transport_total", "DNS queries by transport", ["transport"])
-BIND_RESPONSES_BY_CODE = Counter("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
-BIND_AXFR_SUCCESSES = Counter("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
-BIND_AXFR_FAILURES = Counter("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
+BIND_QUERIES_BY_TYPE = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
+BIND_QUERIES_BY_TRANSPORT = Gauge("bind_queries_by_transport_total", "DNS queries by transport", ["transport"])
+BIND_RESPONSES_BY_CODE = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
+BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
+BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
 BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
 BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
@@ -65,7 +65,10 @@ def query_dns(server_ip, hostname, qtype):
         size = sum(len(str(rdata).encode()) for rdata in answers)
         DNS_ANSWER_SIZE.set(size)
         truncated = any([getattr(answers.response, 'flags', 0) & 0x200])  # TC flag check
-        BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
+        if truncated:
+            BIND_TRUNCATED_PERCENT.set(100)
+        else:
+            BIND_TRUNCATED_PERCENT.set(0)
         if size > 1400:  # Arbitrary threshold for fragmentation risk
             DNS_EDNS_FRAGMENTED.inc()
         return [str(rdata) for rdata in answers], latency, None
@@ -89,34 +92,39 @@ def update_bind_stats():
         r = requests.get(BIND_STATS_URL, timeout=3)
         root = ET.fromstring(r.text)
 
-        hits = int(root.findtext(".//counters[@type='cache']//counter[@name='hits']") or 0)
-        misses = int(root.findtext(".//counters[@type='cache']//counter[@name='misses']") or 0)
+        # Cache hit ratio
+        hits = int(root.findtext(".//counters[@type='cache']//counter[@name='hits']"))
+        misses = int(root.findtext(".//counters[@type='cache']//counter[@name='misses']"))
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
+        # Queries by type
         for counter in root.findall(".//counters[@type='qtype']//counter"):
             qtype = counter.attrib.get("name")
-            value = int(counter.text or 0)
-            BIND_QUERIES_BY_TYPE.labels(qtype=qtype).inc(value)
+            value = int(counter.text)
+            BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(value)
 
+        # Queries by transport (UDP/TCP)
         for counter in root.findall(".//counters[@type='transport']//counter"):
             transport = counter.attrib.get("name")
-            value = int(counter.text or 0)
-            BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).inc(value)
+            value = int(counter.text)
+            BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).set(value)
 
+        # Responses by rcode
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name")
-            value = int(counter.text or 0)
-            BIND_RESPONSES_BY_CODE.labels(rcode=rcode).inc(value)
+            value = int(counter.text)
+            BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(value)
 
+        # Zone stats (AXFR, SOA)
         for zone in root.findall(".//zones//zone"):
             zone_name = zone.attrib.get("name")
             axfr_success = int(zone.findtext("axfr-success") or 0)
             axfr_failure = int(zone.findtext("axfr-failure") or 0)
             refresh = int(zone.findtext("refresh") or 0)
             expiry = int(zone.findtext("expiry") or 0)
-            BIND_AXFR_SUCCESSES.labels(zone=zone_name).inc(axfr_success)
-            BIND_AXFR_FAILURES.labels(zone=zone_name).inc(axfr_failure)
+            BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(axfr_success)
+            BIND_AXFR_FAILURES.labels(zone=zone_name).set(axfr_failure)
             BIND_SOA_REFRESH.labels(zone=zone_name).set(refresh)
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(expiry)
 
@@ -124,29 +132,23 @@ def update_bind_stats():
         print(f"Error fetching BIND stats: {e}")
 
 def update_system_metrics():
-    # CPU utilization
     CPU_UTIL.set(psutil.cpu_percent())
-
-    # NIC utilization
     for nic, stats in psutil.net_io_counters(pernic=True).items():
         utilization = (stats.bytes_sent + stats.bytes_recv) / (1024*1024)
         NIC_UTIL.labels(nic=nic).set(utilization)
 
-    # FRR service status
     frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
     FRR_STATUS.set(1 if frr_running else 0)
 
-    # Chrony service status
     chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
     CHRONYD_STATUS.set(1 if chronyd_running else 0)
 
-    # Chrony time drift (in seconds)
     if chronyd_running:
         try:
             result = subprocess.check_output(["chronyc", "tracking"], text=True)
             for line in result.splitlines():
                 if line.startswith("Last offset"):
-                    # Example line: "Last offset     : 0.001234 s"
+                    # Example: "Last offset     : 0.001234 s"
                     drift_value = float(line.split(":")[1].strip().split()[0])
                     CHRONYD_DRIFT.set(drift_value)
                     break
@@ -164,14 +166,11 @@ def main():
     print("BIND exporter started on :9119")
 
     while True:
-        # Check BIND health
         BIND_UP.set(1 if check_bind_health() else 0)
 
-        # Query DNS directly and via BGP
         direct_result, direct_latency, direct_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
         bgp_result, bgp_latency, bgp_err = query_dns(BGP_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
 
-        # Update latency and record accuracy
         if direct_result:
             BIND_LATENCY.set(direct_latency)
             accuracy = len(set(direct_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
@@ -180,8 +179,7 @@ def main():
             BIND_QUERY_FAILS.inc()
         BIND_RECORD_ACCURACY.set(accuracy)
 
-        # Compare direct vs BGP
-        diff = 0 if direct_result == bgp_result else 1
+        diff = 0 if direct_result and bgp_result and set(direct_result) == set(bgp_result) else 1
         BIND_DIRECT_VS_BGP.set(diff)
 
         # Update system metrics
@@ -190,6 +188,7 @@ def main():
         # Update BIND stats
         update_bind_stats()
 
+        BIND_QUERIES.inc()
         time.sleep(QUERY_INTERVAL)
 
 if __name__ == "__main__":
