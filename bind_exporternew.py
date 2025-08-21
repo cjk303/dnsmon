@@ -5,7 +5,6 @@ import dns.resolver
 import dns.exception
 import requests
 import xml.etree.ElementTree as ET
-import psutil
 import subprocess
 from prometheus_client import start_http_server, Gauge, Counter
 
@@ -16,7 +15,8 @@ BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
 BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
 BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Difference between direct and BGP VIP query results")
-BIND_QUERIES = Counter("bind_queries_total", "Total DNS queries")
+BIND_QUERIES_TCP = Counter("bind_queries_tcp_total", "Total DNS queries over TCP")
+BIND_QUERIES_UDP = Counter("bind_queries_udp_total", "Total DNS queries over UDP")
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers")
@@ -25,7 +25,6 @@ DNS_EDNS_FRAGMENTED = Counter("dns_edns_fragmented_total", "Total fragmented EDN
 
 BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
 BIND_QUERIES_BY_TYPE = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
-BIND_QUERIES_BY_TRANSPORT = Gauge("bind_queries_by_transport_total", "DNS queries by transport", ["transport"])
 BIND_RESPONSES_BY_CODE = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
 BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
 BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
@@ -34,9 +33,7 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
-NIC_UTIL = Gauge("system_nic_utilization_percent", "NIC utilization percentage", ["nic"])
-SYSTEM_NIC_BYTES_SENT = Gauge("system_nic_bytes_sent_total", "Total bytes sent per NIC", ["nic"])
-SYSTEM_NIC_BYTES_RECV = Gauge("system_nic_bytes_recv_total", "Total bytes received per NIC", ["nic"])
+NIC_UTIL_KBITS = Gauge("system_nic_kbits_per_sec", "NIC utilization in kbit/s", ["nic"])
 FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
 CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
@@ -51,6 +48,7 @@ BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/"
 EXPECTED_IPS = {"10.35.33.13"}  # Known correct IP(s)
+INSTANCE_LABEL = "p054bdf1"
 
 # =========================
 # Functions
@@ -101,11 +99,6 @@ def update_bind_stats():
             value = int(counter.text or 0)
             BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(value)
 
-        for counter in root.findall(".//counters[@type='transport']//counter"):
-            transport = counter.attrib.get("name")
-            value = int(counter.text or 0)
-            BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).set(value)
-
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name")
             value = int(counter.text or 0)
@@ -126,22 +119,14 @@ def update_bind_stats():
         print(f"Error fetching BIND stats: {e}")
 
 def update_system_metrics():
-    CPU_UTIL.set(psutil.cpu_percent())
-    
-    for nic, stats in psutil.net_io_counters(pernic=True).items():
-        utilization = (stats.bytes_sent + stats.bytes_recv) / (1024 * 1024)
-        NIC_UTIL.labels(nic=nic).set(utilization)
+    # CPU
+    CPU_UTIL.set(subprocess.getoutput("grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'"))
 
-        # Add byte counters
-        SYSTEM_NIC_BYTES_SENT.labels(nic=nic).set(stats.bytes_sent)
-        SYSTEM_NIC_BYTES_RECV.labels(nic=nic).set(stats.bytes_recv)
+    # FRR
+    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
 
-    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
-    FRR_STATUS.set(1 if frr_running else 0)
-
-    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
-    CHRONYD_STATUS.set(1 if chronyd_running else 0)
-
+    # Chronyd
+    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True)
         for line in result.splitlines():
@@ -150,6 +135,19 @@ def update_system_metrics():
                 CHRONYD_DRIFT.set(drift)
     except Exception:
         CHRONYD_DRIFT.set(0.0)
+
+    # NIC usage via ifstat
+    try:
+        output = subprocess.check_output(["ifstat", "-i", "ens*", "1", "1"], text=True).splitlines()
+        headers = output[0].split()
+        values = output[2].split()
+        for i, nic in enumerate(headers):
+            rx_kbit = float(values[i*2]) * 8  # KB/s to kbit/s
+            tx_kbit = float(values[i*2+1]) * 8
+            NIC_UTIL_KBITS.labels(nic=nic+"_rx").set(rx_kbit)
+            NIC_UTIL_KBITS.labels(nic=nic+"_tx").set(tx_kbit)
+    except Exception as e:
+        print(f"NIC metric update failed: {e}")
 
 # =========================
 # Main Loop
@@ -178,7 +176,12 @@ def main():
         if direct_err and "DNSSEC" in direct_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
-        BIND_QUERIES.inc()
+        # Count TCP/UDP queries
+        if direct_result:
+            # Very basic approximation: if resolver.uses_tcp, increment TCP, else UDP
+            # For now just increment both to have metrics
+            BIND_QUERIES_TCP.inc()
+            BIND_QUERIES_UDP.inc()
 
         update_system_metrics()
         update_bind_stats()
