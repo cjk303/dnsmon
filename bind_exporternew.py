@@ -12,7 +12,6 @@ from prometheus_client import start_http_server, Gauge, Counter
 # =========================
 # Prometheus Metrics
 # =========================
-# BIND metrics
 BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
 BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
@@ -26,8 +25,7 @@ DNS_EDNS_FRAGMENTED = Counter("dns_edns_fragmented_total", "Total fragmented EDN
 
 BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
 BIND_QUERIES_BY_TYPE = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
-BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "DNS queries over TCP")
-BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "DNS queries over UDP")
+BIND_QUERIES_BY_TRANSPORT = Gauge("bind_queries_by_transport_total", "DNS queries by transport", ["transport"])
 BIND_RESPONSES_BY_CODE = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
 BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
 BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
@@ -36,8 +34,7 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
-NIC_KBITS_SENT = Gauge("system_nic_kbits_per_sec_sent", "Network interface transmit rate in kbit/s", ["nic"])
-NIC_KBITS_RECV = Gauge("system_nic_kbits_per_sec_recv", "Network interface receive rate in kbit/s", ["nic"])
+NIC_KBITS_PER_SEC = Gauge("system_nic_kbits_per_sec", "NIC throughput in kbit/s", ["nic"])
 FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
 CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
@@ -52,6 +49,7 @@ BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/"
 EXPECTED_IPS = {"10.35.33.13"}  # Known correct IP(s)
+NIC_PREFIX = "ens"  # Only monitor interfaces starting with this
 
 # =========================
 # Functions
@@ -105,10 +103,7 @@ def update_bind_stats():
         for counter in root.findall(".//counters[@type='transport']//counter"):
             transport = counter.attrib.get("name")
             value = int(counter.text or 0)
-            if transport.upper() == "TCP":
-                BIND_QUERIES_TCP.set(value)
-            elif transport.upper() == "UDP":
-                BIND_QUERIES_UDP.set(value)
+            BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).set(value)
 
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name")
@@ -129,48 +124,50 @@ def update_bind_stats():
     except Exception as e:
         print(f"Error fetching BIND stats: {e}")
 
+# NIC metrics with KB/s calculation
+prev_nic_bytes = {}
+
 def update_system_metrics():
+    global prev_nic_bytes
+
     CPU_UTIL.set(psutil.cpu_percent())
 
-    # FRR and Chronyd status
-    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
-    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
+    nic_stats = psutil.net_io_counters(pernic=True)
+    for nic, stats in nic_stats.items():
+        if not nic.startswith(NIC_PREFIX):
+            continue
+
+        current_bytes = stats.bytes_sent + stats.bytes_recv
+        prev_bytes = prev_nic_bytes.get(nic, current_bytes)
+        kb_per_sec = ((current_bytes - prev_bytes) / 1024) / QUERY_INTERVAL
+        NIC_KBITS_PER_SEC.labels(nic=nic).set(kb_per_sec * 8)  # kbit/s
+        prev_nic_bytes[nic] = current_bytes
+
+    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
+    FRR_STATUS.set(1 if frr_running else 0)
+
+    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
+    CHRONYD_STATUS.set(1 if chronyd_running else 0)
 
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True)
         for line in result.splitlines():
             if line.strip().startswith("Last offset"):
-                drift = float(line.split()[-2])
+                drift = float(line.split()[-2])  # seconds
                 CHRONYD_DRIFT.set(drift)
     except Exception:
         CHRONYD_DRIFT.set(0.0)
-
-def update_nic_traffic():
-    """Use ifstat to get kbit/s for all interfaces starting with ens"""
-    try:
-        ens_interfaces = [nic for nic in psutil.net_io_counters(pernic=True) if nic.startswith("ens")]
-        for nic in ens_interfaces:
-            result = subprocess.check_output(["ifstat", "-i", nic, "1", "1"], text=True)
-            lines = result.strip().splitlines()
-            if len(lines) >= 3:
-                values = lines[2].split()
-                recv = float(values[0]) * 8  # KB/s → kbit/s
-                send = float(values[1]) * 8
-                NIC_KBITS_RECV.labels(nic=nic).set(recv)
-                NIC_KBITS_SENT.labels(nic=nic).set(send)
-    except Exception as e:
-        print(f"Error updating NIC traffic: {e}")
 
 # =========================
 # Main Loop
 # =========================
 def main():
     start_http_server(9119, addr="0.0.0.0")
-    print("Exporter started on :9119")
+    print("BIND exporter started on :9119")
 
     while True:
-        # BIND health & query
         BIND_UP.set(1 if check_bind_health() else 0)
+
         direct_result, direct_latency, direct_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
         bgp_result, _, _ = query_dns(BGP_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
 
@@ -190,9 +187,7 @@ def main():
 
         BIND_QUERIES.inc()
 
-        # Update system metrics
         update_system_metrics()
-        update_nic_traffic()
         update_bind_stats()
 
         time.sleep(QUERY_INTERVAL)
