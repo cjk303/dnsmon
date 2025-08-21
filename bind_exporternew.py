@@ -50,10 +50,17 @@ QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/"
 EXPECTED_IPS = {"10.35.33.13"}  # Known correct IP(s)
 
+# Predefined lists for labeled metrics
+QTYPE_LIST = ["A", "AAAA", "MX", "NS", "CNAME"]
+TRANSPORT_LIST = ["udp", "tcp", "tls"]
+RCODE_LIST = ["NOERROR", "NXDOMAIN", "SERVFAIL"]
+ZONE_LIST = ["example.com", "example.net"]
+
 # =========================
-# Initialize metrics with default values
+# Functions
 # =========================
 def initialize_metrics():
+    """Pre-initialize all metrics and labeled metrics with default values"""
     BIND_UP.set(0)
     BIND_LATENCY.set(0)
     BIND_RECORD_ACCURACY.set(0)
@@ -70,9 +77,21 @@ def initialize_metrics():
     CHRONYD_STATUS.set(0)
     BIND_CACHE_HIT_RATIO.set(0)
 
-# =========================
-# Functions
-# =========================
+    for qtype in QTYPE_LIST:
+        BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(0)
+    for transport in TRANSPORT_LIST:
+        BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).set(0)
+    for rcode in RCODE_LIST:
+        BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(0)
+    for zone in ZONE_LIST:
+        BIND_AXFR_SUCCESSES.labels(zone=zone).set(0)
+        BIND_AXFR_FAILURES.labels(zone=zone).set(0)
+        BIND_SOA_REFRESH.labels(zone=zone).set(0)
+        BIND_SOA_EXPIRY.labels(zone=zone).set(0)
+
+    for nic in psutil.net_io_counters(pernic=True).keys():
+        NIC_UTIL.labels(nic=nic).set(0)
+
 def query_dns(server_ip, hostname, qtype):
     resolver = dns.resolver.Resolver()
     resolver.nameservers = [server_ip]
@@ -84,9 +103,9 @@ def query_dns(server_ip, hostname, qtype):
         latency = time.time() - start_time
         size = sum(len(str(rdata).encode()) for rdata in answers)
         DNS_ANSWER_SIZE.set(size)
-        truncated = bool(getattr(answers.response, "flags", 0) & 0x200)  # TC flag
+        truncated = bool(getattr(answers.response, "flags", 0) & 0x200)
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
-        if size > 1400:  # threshold for fragmentation risk
+        if size > 1400:
             DNS_EDNS_FRAGMENTED.inc()
         return [str(rdata) for rdata in answers], latency, None
     except dns.resolver.NXDOMAIN:
@@ -149,17 +168,14 @@ def update_system_metrics():
         utilization = (stats.bytes_sent + stats.bytes_recv) / (1024 * 1024)
         NIC_UTIL.labels(nic=nic).set(utilization)
 
-    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
-    FRR_STATUS.set(1 if frr_running else 0)
-
-    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
-    CHRONYD_STATUS.set(1 if chronyd_running else 0)
+    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
+    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
 
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True)
         for line in result.splitlines():
             if line.strip().startswith("Last offset"):
-                drift = float(line.split()[-2])  # seconds
+                drift = float(line.split()[-2])
                 CHRONYD_DRIFT.set(drift)
     except Exception:
         CHRONYD_DRIFT.set(0.0)
