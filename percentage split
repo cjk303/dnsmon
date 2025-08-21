@@ -1,0 +1,31 @@
+{
+  "type": "timeseries",
+  "title": "BIND Queries Transport % Split",
+  "datasource": "Prometheus",
+  "targets": [
+    {
+      "expr": "100 * bind_queries_by_transport_total{transport=\"udp\"} / sum(bind_queries_by_transport_total)",
+      "legendFormat": "UDP %",
+      "refId": "A"
+    },
+    {
+      "expr": "100 * bind_queries_by_transport_total{transport=\"tcp\"} / sum(bind_queries_by_transport_total)",
+      "legendFormat": "TCP %",
+      "refId": "B"
+    }
+  ],
+  "fieldConfig": {
+    "defaults": {
+      "unit": "percent"
+    }
+  },
+  "options": {
+    "tooltip": {
+      "mode": "all"
+    },
+    "legend": {
+      "displayMode": "list",
+      "placement": "bottom"
+    }
+  }
+}
