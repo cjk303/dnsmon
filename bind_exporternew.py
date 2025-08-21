@@ -5,24 +5,25 @@ import dns.resolver
 import dns.exception
 import requests
 import xml.etree.ElementTree as ET
+import psutil
 import subprocess
+import re
 from prometheus_client import start_http_server, Gauge, Counter
 
 # =========================
 # Prometheus Metrics
 # =========================
+# BIND metrics
 BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
 BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
 BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Difference between direct and BGP VIP query results")
-BIND_QUERIES_TCP = Counter("bind_queries_tcp_total", "Total DNS queries over TCP")
-BIND_QUERIES_UDP = Counter("bind_queries_udp_total", "Total DNS queries over UDP")
+BIND_QUERIES = Counter("bind_queries_total", "Total DNS queries")
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers")
 DNS_ANSWER_SIZE = Gauge("dns_answer_size_bytes", "DNS answer size in bytes")
 DNS_EDNS_FRAGMENTED = Counter("dns_edns_fragmented_total", "Total fragmented EDNS answers")
-
 BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
 BIND_QUERIES_BY_TYPE = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
 BIND_RESPONSES_BY_CODE = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
@@ -30,13 +31,18 @@ BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone tra
 BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
 BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
 BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
+BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total TCP DNS queries")
+BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total UDP DNS queries")
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
-NIC_UTIL_KBITS = Gauge("system_nic_kbits_per_sec", "NIC utilization in kbit/s", ["nic"])
 FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
 CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
+
+# NIC throughput using ifstat
+NIC_KBITS_SENT = Gauge("system_nic_kbits_per_sec_sent", "NIC transmit speed in kbit/s", ["nic"])
+NIC_KBITS_RECV = Gauge("system_nic_kbits_per_sec_recv", "NIC receive speed in kbit/s", ["nic"])
 
 # =========================
 # Configuration
@@ -48,7 +54,6 @@ BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/"
 EXPECTED_IPS = {"10.35.33.13"}  # Known correct IP(s)
-INSTANCE_LABEL = "p054bdf1"
 
 # =========================
 # Functions
@@ -66,7 +71,7 @@ def query_dns(server_ip, hostname, qtype):
         DNS_ANSWER_SIZE.set(size)
         truncated = bool(getattr(answers.response, "flags", 0) & 0x200)  # TC flag
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
-        if size > 1400:  # threshold for fragmentation risk
+        if size > 1400:
             DNS_EDNS_FRAGMENTED.inc()
         return [str(rdata) for rdata in answers], latency, None
     except dns.resolver.NXDOMAIN:
@@ -115,39 +120,55 @@ def update_bind_stats():
             BIND_SOA_REFRESH.labels(zone=zone_name).set(refresh)
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(expiry)
 
+        # TCP and UDP queries
+        tcp = int(root.findtext(".//counters[@type='transport']//counter[@name='TCP']") or 0)
+        udp = int(root.findtext(".//counters[@type='transport']//counter[@name='UDP']") or 0)
+        BIND_QUERIES_TCP.set(tcp)
+        BIND_QUERIES_UDP.set(udp)
+
     except Exception as e:
         print(f"Error fetching BIND stats: {e}")
 
 def update_system_metrics():
-    # CPU
-    CPU_UTIL.set(subprocess.getoutput("grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'"))
+    CPU_UTIL.set(psutil.cpu_percent())
 
-    # FRR
-    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
+    # FRR and Chrony
+    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
+    FRR_STATUS.set(1 if frr_running else 0)
 
-    # Chronyd
-    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
+    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
+    CHRONYD_STATUS.set(1 if chronyd_running else 0)
+
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True)
         for line in result.splitlines():
             if line.strip().startswith("Last offset"):
-                drift = float(line.split()[-2])  # seconds
+                drift = float(line.split()[-2])
                 CHRONYD_DRIFT.set(drift)
     except Exception:
         CHRONYD_DRIFT.set(0.0)
 
-    # NIC usage via ifstat
+def update_nic_throughput():
+    """
+    Uses ifstat to get kbit/s transmit/receive for interfaces starting with 'ens'.
+    """
     try:
-        output = subprocess.check_output(["ifstat", "-i", "ens*", "1", "1"], text=True).splitlines()
-        headers = output[0].split()
-        values = output[2].split()
+        result = subprocess.check_output(["ifstat", "-n", "-i", "ens*", "1", "1"], text=True)
+        lines = result.strip().splitlines()
+        if len(lines) < 3:
+            return
+
+        headers = re.findall(r'\S+', lines[0])
+        values = re.findall(r'\S+', lines[2])
+
         for i, nic in enumerate(headers):
-            rx_kbit = float(values[i*2]) * 8  # KB/s to kbit/s
-            tx_kbit = float(values[i*2+1]) * 8
-            NIC_UTIL_KBITS.labels(nic=nic+"_rx").set(rx_kbit)
-            NIC_UTIL_KBITS.labels(nic=nic+"_tx").set(tx_kbit)
+            sent = float(values[i*2])
+            recv = float(values[i*2 + 1])
+            NIC_KBITS_SENT.labels(nic=nic).set(sent)
+            NIC_KBITS_RECV.labels(nic=nic).set(recv)
+
     except Exception as e:
-        print(f"NIC metric update failed: {e}")
+        print(f"Error updating NIC throughput: {e}")
 
 # =========================
 # Main Loop
@@ -176,15 +197,11 @@ def main():
         if direct_err and "DNSSEC" in direct_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
-        # Count TCP/UDP queries
-        if direct_result:
-            # Very basic approximation: if resolver.uses_tcp, increment TCP, else UDP
-            # For now just increment both to have metrics
-            BIND_QUERIES_TCP.inc()
-            BIND_QUERIES_UDP.inc()
+        BIND_QUERIES.inc()
 
         update_system_metrics()
         update_bind_stats()
+        update_nic_throughput()
 
         time.sleep(QUERY_INTERVAL)
 
