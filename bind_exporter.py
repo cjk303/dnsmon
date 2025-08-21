@@ -82,4 +82,115 @@ def check_bind_health():
         sock.close()
         return True
     except OSError:
-        r
+        return False
+
+def update_bind_stats():
+    try:
+        r = requests.get(BIND_STATS_URL, timeout=3)
+        root = ET.fromstring(r.text)
+
+        hits = int(root.findtext(".//counters[@type='cache']//counter[@name='hits']") or 0)
+        misses = int(root.findtext(".//counters[@type='cache']//counter[@name='misses']") or 0)
+        ratio = hits / (hits + misses) if (hits + misses) > 0 else 0
+        BIND_CACHE_HIT_RATIO.set(ratio)
+
+        for counter in root.findall(".//counters[@type='qtype']//counter"):
+            qtype = counter.attrib.get("name")
+            value = int(counter.text or 0)
+            BIND_QUERIES_BY_TYPE.labels(qtype=qtype).inc(value)
+
+        for counter in root.findall(".//counters[@type='transport']//counter"):
+            transport = counter.attrib.get("name")
+            value = int(counter.text or 0)
+            BIND_QUERIES_BY_TRANSPORT.labels(transport=transport).inc(value)
+
+        for counter in root.findall(".//counters[@type='rcode']//counter"):
+            rcode = counter.attrib.get("name")
+            value = int(counter.text or 0)
+            BIND_RESPONSES_BY_CODE.labels(rcode=rcode).inc(value)
+
+        for zone in root.findall(".//zones//zone"):
+            zone_name = zone.attrib.get("name")
+            axfr_success = int(zone.findtext("axfr-success") or 0)
+            axfr_failure = int(zone.findtext("axfr-failure") or 0)
+            refresh = int(zone.findtext("refresh") or 0)
+            expiry = int(zone.findtext("expiry") or 0)
+            BIND_AXFR_SUCCESSES.labels(zone=zone_name).inc(axfr_success)
+            BIND_AXFR_FAILURES.labels(zone=zone_name).inc(axfr_failure)
+            BIND_SOA_REFRESH.labels(zone=zone_name).set(refresh)
+            BIND_SOA_EXPIRY.labels(zone=zone_name).set(expiry)
+
+    except Exception as e:
+        print(f"Error fetching BIND stats: {e}")
+
+def update_system_metrics():
+    # CPU utilization
+    CPU_UTIL.set(psutil.cpu_percent())
+
+    # NIC utilization
+    for nic, stats in psutil.net_io_counters(pernic=True).items():
+        utilization = (stats.bytes_sent + stats.bytes_recv) / (1024*1024)
+        NIC_UTIL.labels(nic=nic).set(utilization)
+
+    # FRR service status
+    frr_running = subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0
+    FRR_STATUS.set(1 if frr_running else 0)
+
+    # Chrony service status
+    chronyd_running = subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0
+    CHRONYD_STATUS.set(1 if chronyd_running else 0)
+
+    # Chrony time drift (in seconds)
+    if chronyd_running:
+        try:
+            result = subprocess.check_output(["chronyc", "tracking"], text=True)
+            for line in result.splitlines():
+                if line.startswith("Last offset"):
+                    # Example line: "Last offset     : 0.001234 s"
+                    drift_value = float(line.split(":")[1].strip().split()[0])
+                    CHRONYD_DRIFT.set(drift_value)
+                    break
+        except Exception as e:
+            print(f"Failed to parse chrony drift: {e}")
+            CHRONYD_DRIFT.set(0.0)
+    else:
+        CHRONYD_DRIFT.set(0.0)
+
+# =========================
+# Main Loop
+# =========================
+def main():
+    start_http_server(9119, addr="0.0.0.0")
+    print("BIND exporter started on :9119")
+
+    while True:
+        # Check BIND health
+        BIND_UP.set(1 if check_bind_health() else 0)
+
+        # Query DNS directly and via BGP
+        direct_result, direct_latency, direct_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
+        bgp_result, bgp_latency, bgp_err = query_dns(BGP_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE)
+
+        # Update latency and record accuracy
+        if direct_result:
+            BIND_LATENCY.set(direct_latency)
+            accuracy = len(set(direct_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
+        else:
+            accuracy = 0
+            BIND_QUERY_FAILS.inc()
+        BIND_RECORD_ACCURACY.set(accuracy)
+
+        # Compare direct vs BGP
+        diff = 0 if direct_result == bgp_result else 1
+        BIND_DIRECT_VS_BGP.set(diff)
+
+        # Update system metrics
+        update_system_metrics()
+
+        # Update BIND stats
+        update_bind_stats()
+
+        time.sleep(QUERY_INTERVAL)
+
+if __name__ == "__main__":
+    main()
