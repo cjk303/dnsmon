@@ -24,6 +24,9 @@ EXPECTED_IPS = {"10.35.33.13"}      # Known correct IP(s)
 # Monitor exactly this interface
 IFACE_NAME = "ens33"
 
+# Path to BIND log
+LOG_PATH = "/var/log/named/default.log"
+
 # =========================
 # Prometheus Metrics
 # =========================
@@ -49,6 +52,10 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
 BIND_QUERIES_UDP = Counter("bind_queries_udp_total", "Total DNS queries over UDP (exporter probe)")
 BIND_QUERIES_TCP = Counter("bind_queries_tcp_total", "Total DNS queries over TCP (exporter probe)")
+
+# SERVFAIL metrics
+BIND_SERVFAIL_COUNT = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
+BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
@@ -132,6 +139,36 @@ def update_bind_stats():
 
     except Exception as e:
         print(f"[bind-stats] Error: {e}")
+
+# =========================
+# SERVFAIL metrics
+# =========================
+SERVFAIL_REGEX = re.compile(r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .* SERVFAIL", re.IGNORECASE)
+last_log_position = 0
+
+def update_servfail_metrics():
+    global last_log_position
+    try:
+        with open(LOG_PATH, "r") as f:
+            f.seek(last_log_position)
+            for line in f:
+                match = SERVFAIL_REGEX.search(line)
+                if match:
+                    date_str = match.group(1)
+                    ts = None
+                    try:
+                        ts = time.mktime(time.strptime(date_str, "%d-%b-%Y %H:%M:%S.%f"))
+                    except ValueError:
+                        ts = time.mktime(time.strptime(date_str, "%d-%b-%Y %H:%M:%S"))
+
+                    BIND_SERVFAIL_COUNT.inc()
+                    if ts:
+                        BIND_SERVFAIL_LAST.set(ts)
+            last_log_position = f.tell()
+    except FileNotFoundError:
+        print(f"[servfail] Log file {LOG_PATH} not found")
+    except Exception as e:
+        print(f"[servfail] Error parsing logs: {e}")
 
 # =========================
 # NIC metrics (ifstat)
@@ -218,6 +255,7 @@ def main():
         update_system_metrics()
         update_nic_metrics_ifstat()
         update_bind_stats()
+        update_servfail_metrics()  # <-- New SERVFAIL metrics
 
         time.sleep(QUERY_INTERVAL)
 
