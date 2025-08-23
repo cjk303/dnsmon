@@ -8,6 +8,7 @@ import requests
 import xml.etree.ElementTree as ET
 import psutil
 import subprocess
+from datetime import datetime
 from prometheus_client import start_http_server, Gauge, Counter
 
 # =========================
@@ -143,8 +144,17 @@ def update_bind_stats():
 # =========================
 # SERVFAIL metrics
 # =========================
-SERVFAIL_REGEX = re.compile(r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .* SERVFAIL", re.IGNORECASE)
+SERVFAIL_REGEX = re.compile(
+    r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)",
+    re.IGNORECASE,
+)
 last_log_position = 0
+
+def parse_bind_timestamp(date_str):
+    try:
+        return datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S.%f").timestamp()
+    except ValueError:
+        return datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S").timestamp()
 
 def update_servfail_metrics():
     global last_log_position
@@ -155,15 +165,9 @@ def update_servfail_metrics():
                 match = SERVFAIL_REGEX.search(line)
                 if match:
                     date_str = match.group(1)
-                    ts = None
-                    try:
-                        ts = time.mktime(time.strptime(date_str, "%d-%b-%Y %H:%M:%S.%f"))
-                    except ValueError:
-                        ts = time.mktime(time.strptime(date_str, "%d-%b-%Y %H:%M:%S"))
-
+                    ts = parse_bind_timestamp(date_str)
                     BIND_SERVFAIL_COUNT.inc()
-                    if ts:
-                        BIND_SERVFAIL_LAST.set(ts)
+                    BIND_SERVFAIL_LAST.set(ts)
             last_log_position = f.tell()
     except FileNotFoundError:
         print(f"[servfail] Log file {LOG_PATH} not found")
