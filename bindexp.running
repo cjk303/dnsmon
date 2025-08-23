@@ -61,6 +61,12 @@ NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 
 # =========================
+# Track last seen values for bind stats
+# =========================
+last_qry_udp = None
+last_qry_tcp = None
+
+# =========================
 # DNS Helpers
 # =========================
 def query_dns(server_ip, hostname, qtype, use_tcp=False):
@@ -102,52 +108,65 @@ def check_bind_health():
 # BIND Stats
 # =========================
 def update_bind_stats():
+    global last_qry_udp, last_qry_tcp
     try:
         r = requests.get(BIND_STATS_URL, timeout=3)
-        text = r.text
+        lines = r.text.splitlines()
+        if len(lines) < 3:
+            print("[bind-stats] Unexpected stats output format")
+            return
+        xml_text = lines[2].strip()
 
-        # Extract CacheHits / CacheMisses directly
-        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', text)
-        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', text)
+        root = ET.fromstring(xml_text)
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}', 1)[1]
+
+        # Cache hit ratio
+        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', xml_text)
+        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', xml_text)
         hits = int(hits_match.group(1)) if hits_match else 0
         misses = int(misses_match.group(1)) if misses_match else 0
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # Parse other metrics
-        root = ET.fromstring(text)
-        for elem in root.iter():
-            if '}' in elem.tag:
-                elem.tag = elem.tag.split('}', 1)[1]
+        # QryUDP / QryTCP counters
+        qry_udp = root.find(".//counter[@name='QryUDP']")
+        qry_tcp = root.find(".//counter[@name='QryTCP']")
 
+        udp_val = int(qry_udp.text or 0) if qry_udp is not None else 0
+        tcp_val = int(qry_tcp.text or 0) if qry_tcp is not None else 0
+
+        if last_qry_udp is not None:
+            delta = udp_val - last_qry_udp
+            if delta > 0:
+                BIND_QUERIES.labels(protocol="udp", source="bindstats").inc(delta)
+        last_qry_udp = udp_val
+
+        if last_qry_tcp is not None:
+            delta = tcp_val - last_qry_tcp
+            if delta > 0:
+                BIND_QUERIES.labels(protocol="tcp", source="bindstats").inc(delta)
+        last_qry_tcp = tcp_val
+
+        # Qtype metrics
         for counter in root.findall(".//counters[@type='qtype']//counter"):
             qtype = counter.attrib.get("name", "UNKNOWN")
             BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(int(counter.text or 0))
 
+        # Rcode metrics
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name", "UNKNOWN")
             BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
 
-        # QryUDP / QryTCP from BIND stats
-        for counter in root.findall(".//counters[@type='nsstat']//counter"):
-            name = counter.attrib.get("name", "")
-            if name == "QryUDP":
-                BIND_QUERIES.labels(protocol="udp", source="bindstats").inc(int(counter.text or 0))
-            elif name == "QryTCP":
-                BIND_QUERIES.labels(protocol="tcp", source="bindstats").inc(int(counter.text or 0))
-
-        # Optional: total queries (udp+tcp)
-        total_udp = root.findtext(".//counters[@type='nsstat']//counter[@name='QryUDP']")
-        total_tcp = root.findtext(".//counters[@type='nsstat']//counter[@name='QryTCP']")
-        if total_udp and total_tcp:
-            BIND_QUERIES.labels(protocol="all", source="bindstats").inc(int(total_udp) + int(total_tcp))
-
+        # Zone metrics
         for zone in root.findall(".//zones//zone"):
             zone_name = zone.attrib.get("name", "")
             BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(int(zone.findtext("axfr-success") or 0))
             BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
+
     except Exception as e:
         print(f"[bind-stats] Error: {e}")
 
