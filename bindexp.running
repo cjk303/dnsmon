@@ -27,7 +27,6 @@ LOG_PATH = "/var/log/named/default.log"
 # =========================
 # Prometheus Metrics
 # =========================
-# BIND metrics
 BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
 BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
@@ -104,29 +103,24 @@ def check_bind_health():
 # =========================
 # BIND Stats
 # =========================
-def strip_namespace(root):
-    for elem in root.iter():
-        if '}' in elem.tag:
-            elem.tag = elem.tag.split('}', 1)[1]
-    return root
-
 def update_bind_stats():
     try:
         r = requests.get(BIND_STATS_URL, timeout=3)
-        root = ET.fromstring(r.text)
-        root = strip_namespace(root)
+        text = r.text
 
-        hits = misses = 0
-        for counter in root.iter('counter'):
-            name = counter.attrib.get('name', '').lower()
-            value = int(counter.text or 0)
-            if name == 'cachehits':
-                hits = value
-            elif name == 'cachemisses':
-                misses = value
-
+        # Extract CacheHits / CacheMisses directly
+        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', text)
+        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', text)
+        hits = int(hits_match.group(1)) if hits_match else 0
+        misses = int(misses_match.group(1)) if misses_match else 0
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
+
+        # Parse other metrics
+        root = ET.fromstring(text)
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}', 1)[1]
 
         for counter in root.findall(".//counters[@type='qtype']//counter"):
             qtype = counter.attrib.get("name", "UNKNOWN")
@@ -142,7 +136,6 @@ def update_bind_stats():
             BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
-
     except Exception as e:
         print(f"[bind-stats] Error: {e}")
 
@@ -171,8 +164,6 @@ def update_servfail_metrics():
                     BIND_SERVFAIL_TOTAL.inc()
                     BIND_SERVFAIL_LAST.set(ts)
             last_log_position = f.tell()
-    except FileNotFoundError:
-        print(f"[servfail] Log file {LOG_PATH} not found")
     except Exception as e:
         print(f"[servfail] Error parsing logs: {e}")
 
@@ -192,7 +183,7 @@ def update_system_metrics():
                 drift = float(m.group(1))
                 break
         CHRONYD_DRIFT.set(drift)
-    except Exception as e:
+    except Exception:
         CHRONYD_DRIFT.set(0.0)
 
 def update_nic_metrics_ifstat():
@@ -213,11 +204,10 @@ def update_nic_metrics_ifstat():
 # =========================
 def main():
     start_http_server(9119, addr="0.0.0.0")
-    print("Exporter started on port 9119, monitoring interface: {}".format(IFACE_NAME))
+    print(f"Exporter started on port 9119, monitoring interface: {IFACE_NAME}")
 
     while True:
         BIND_UP.set(1 if check_bind_health() else 0)
-
         udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
         tcp_result, _, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
 
