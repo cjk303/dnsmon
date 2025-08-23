@@ -110,13 +110,14 @@ def update_bind_stats():
         hits = misses = 0
         for counters in root.findall(".//counters"):
             if counters.attrib.get("type") == "cache":
-                for counter in counters.findall("counter"):
+                for counter in counters.iter('counter'):
                     name = counter.attrib.get("name", "").lower()
+                    value = int(counter.text or 0)
                     if name == "cachehits":
-                        hits = int(counter.text or 0)
+                        hits = value
                     elif name == "cachemisses":
-                        misses = int(counter.text or 0)
-        ratio = hits / (hits + misses) if (hits + misses) > 0 else float('nan')
+                        misses = value
+        ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
         for counter in root.findall(".//counters[@type='qtype']//counter"):
