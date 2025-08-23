@@ -31,7 +31,7 @@ BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
 BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
 BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Difference between direct and BGP VIP query results")
-BIND_QUERIES = Counter("bind_queries_total", "Total DNS queries")
+BIND_QUERIES = Counter("bind_queries_total", "Total DNS queries", ["protocol", "source"])
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers")
@@ -44,8 +44,6 @@ BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone tra
 BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
 BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
 BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
-BIND_QUERIES_UDP = Counter("bind_queries_udp_total", "Total DNS queries over UDP (exporter probe)")
-BIND_QUERIES_TCP = Counter("bind_queries_tcp_total", "Total DNS queries over TCP (exporter probe)")
 
 # SERVFAIL metrics
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
@@ -80,11 +78,10 @@ def query_dns(server_ip, hostname, qtype, use_tcp=False):
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
         if size > 1400:
             DNS_EDNS_FRAGMENTED.inc()
-        BIND_QUERIES.inc()
         if use_tcp:
-            BIND_QUERIES_TCP.inc()
+            BIND_QUERIES.labels(protocol="tcp", source="probe").inc()
         else:
-            BIND_QUERIES_UDP.inc()
+            BIND_QUERIES.labels(protocol="udp", source="probe").inc()
         return [str(rdata) for rdata in answers], latency, None
     except dns.resolver.NXDOMAIN:
         return None, None, "NXDOMAIN"
@@ -130,6 +127,20 @@ def update_bind_stats():
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name", "UNKNOWN")
             BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
+
+        # QryUDP / QryTCP from BIND stats
+        for counter in root.findall(".//counters[@type='nsstat']//counter"):
+            name = counter.attrib.get("name", "")
+            if name == "QryUDP":
+                BIND_QUERIES.labels(protocol="udp", source="bindstats").inc(int(counter.text or 0))
+            elif name == "QryTCP":
+                BIND_QUERIES.labels(protocol="tcp", source="bindstats").inc(int(counter.text or 0))
+
+        # Optional: total queries (udp+tcp)
+        total_udp = root.findtext(".//counters[@type='nsstat']//counter[@name='QryUDP']")
+        total_tcp = root.findtext(".//counters[@type='nsstat']//counter[@name='QryTCP']")
+        if total_udp and total_tcp:
+            BIND_QUERIES.labels(protocol="all", source="bindstats").inc(int(total_udp) + int(total_tcp))
 
         for zone in root.findall(".//zones//zone"):
             zone_name = zone.attrib.get("name", "")
