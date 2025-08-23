@@ -102,10 +102,17 @@ def check_bind_health():
 # =========================
 # BIND stats
 # =========================
+def strip_namespace(root):
+    for elem in root.iter():
+        if '}' in elem.tag:
+            elem.tag = elem.tag.split('}', 1)[1]
+    return root
+
 def update_bind_stats():
     try:
         r = requests.get(BIND_STATS_URL, timeout=3)
         root = ET.fromstring(r.text)
+        root = strip_namespace(root)
 
         hits = misses = 0
         for counters in root.findall(".//counters"):
