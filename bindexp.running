@@ -113,14 +113,14 @@ def update_bind_stats():
                 elem.tag = elem.tag.split('}', 1)[1]
 
         # Cache hit ratio
-        hits_match = re.search(r'<counter name=\"CacheHits\">(\d+)</counter>', xml_text)
-        misses_match = re.search(r'<counter name=\"CacheMisses\">(\d+)</counter>', xml_text)
+        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', xml_text)
+        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', xml_text)
         hits = int(hits_match.group(1)) if hits_match else 0
         misses = int(misses_match.group(1)) if misses_match else 0
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # QryUDP / QryTCP counters (Gauges)
+        # QryUDP / QryTCP counters
         qry_udp = root.find(".//counter[@name='QryUDP']")
         qry_tcp = root.find(".//counter[@name='QryTCP']")
         udp_val = int(qry_udp.text or 0) if qry_udp is not None else 0
