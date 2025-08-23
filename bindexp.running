@@ -149,14 +149,19 @@ def update_bind_stats():
 # =========================
 # SERVFAIL Metrics
 # =========================
-SERVFAIL_REGEX = re.compile(r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)", re.IGNORECASE)
+SERVFAIL_REGEX = re.compile(
+    r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)",
+    re.IGNORECASE
+)
 last_log_position = 0
 
 def parse_bind_timestamp(date_str):
-    try:
-        return datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S.%f").timestamp()
-    except ValueError:
-        return datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S").timestamp()
+    for fmt in ("%d-%b-%Y %H:%M:%S.%f", "%d-%b-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(date_str, fmt).timestamp()
+        except ValueError:
+            continue
+    return time.time()  # fallback
 
 def update_servfail_metrics():
     global last_log_position
@@ -171,6 +176,8 @@ def update_servfail_metrics():
                     BIND_SERVFAIL_TOTAL.inc()
                     BIND_SERVFAIL_LAST.set(ts)
             last_log_position = f.tell()
+    except FileNotFoundError:
+        print(f"[servfail] Log file not found: {LOG_PATH}")
     except Exception as e:
         print(f"[servfail] Error parsing logs: {e}")
 
