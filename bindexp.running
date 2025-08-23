@@ -102,28 +102,19 @@ def check_bind_health():
 # =========================
 # BIND stats
 # =========================
-def strip_namespace(root):
-    for elem in root.iter():
-        if '}' in elem.tag:
-            elem.tag = elem.tag.split('}', 1)[1]
-    return root
-
 def update_bind_stats():
     try:
         r = requests.get(BIND_STATS_URL, timeout=3)
         root = ET.fromstring(r.text)
-        root = strip_namespace(root)
 
         hits = misses = 0
-        for counters in root.findall(".//counters"):
-            if counters.attrib.get("type") == "cache":
-                for counter in counters.iter('counter'):
-                    name = counter.attrib.get("name", "").lower()
-                    value = int(counter.text or 0)
-                    if name == "cachehits":
-                        hits = value
-                    elif name == "cachemisses":
-                        misses = value
+        for counter in root.iter('counter'):
+            name = counter.attrib.get('name', '').lower()
+            if name == 'cachehits':
+                hits = int(counter.text or 0)
+            elif name == 'cachemisses':
+                misses = int(counter.text or 0)
+
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
