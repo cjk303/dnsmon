@@ -19,7 +19,7 @@ DNS_TEST_TYPE = "A"
 DIRECT_DNS = "127.0.0.1"
 BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
-BIND_STATS_URL = "http://127.0.0.1:8053/"
+BIND_STATS_URL = "http://127.0.0.1:8053/xml/v3"
 EXPECTED_IPS = {"10.35.33.13"}      # Known correct IP(s)
 
 # Monitor exactly this interface
@@ -118,9 +118,16 @@ def update_bind_stats():
         r = requests.get(BIND_STATS_URL, timeout=3)
         root = ET.fromstring(r.text)
 
-        hits = int(root.findtext(".//counters[@type='cache']//counter[@name='hits']") or 0)
-        misses = int(root.findtext(".//counters[@type='cache']//counter[@name='misses']") or 0)
-        ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
+        # Cache hit ratio parsing for BIND 9.18
+        hits = misses = 0
+        for counters in root.findall(".//counters"):
+            if counters.attrib.get("type") == "cache":
+                for counter in counters.findall("counter"):
+                    if counter.attrib.get("name") == "hits":
+                        hits = int(counter.text or 0)
+                    elif counter.attrib.get("name") == "misses":
+                        misses = int(counter.text or 0)
+        ratio = hits / (hits + misses) if (hits + misses) > 0 else float('nan')
         BIND_CACHE_HIT_RATIO.set(ratio)
 
         for counter in root.findall(".//counters[@type='qtype']//counter"):
@@ -253,15 +260,3 @@ def main():
         else:
             BIND_DIRECT_VS_BGP.set(1)
 
-        if udp_err and "DNSSEC" in udp_err.upper():
-            BIND_SECURITY_ERRORS.inc()
-
-        update_system_metrics()
-        update_nic_metrics_ifstat()
-        update_bind_stats()
-        update_servfail_metrics()  # <-- New SERVFAIL metrics
-
-        time.sleep(QUERY_INTERVAL)
-
-if __name__ == "__main__":
-    main()
