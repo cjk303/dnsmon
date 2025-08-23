@@ -53,6 +53,7 @@ BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SE
 
 # System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
+MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
 FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
 CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
@@ -186,6 +187,20 @@ def update_system_metrics():
     except Exception:
         CHRONYD_DRIFT.set(0.0)
 
+def update_memory_metrics():
+    try:
+        result = subprocess.check_output(["free", "-m"], text=True)
+        lines = result.splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            total = int(parts[1])
+            used = int(parts[2])
+            utilization = used / total * 100
+            MEM_UTIL.set(utilization)
+    except Exception as e:
+        print(f"[memory] Error updating memory metrics: {e}")
+        MEM_UTIL.set(0.0)
+
 def update_nic_metrics_ifstat():
     try:
         cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
@@ -228,6 +243,7 @@ def main():
             BIND_SECURITY_ERRORS.inc()
 
         update_system_metrics()
+        update_memory_metrics()
         update_nic_metrics_ifstat()
         update_bind_stats()
         update_servfail_metrics()
