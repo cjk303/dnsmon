@@ -145,6 +145,8 @@ def update_bind_stats():
             BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
+    except Exception as e:
+        print(f"[bind-stats] Error: {e}")
 
 # =========================
 # SERVFAIL Metrics
