@@ -48,8 +48,8 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 BIND_QUERIES_UDP = Counter("bind_queries_udp_total", "Total DNS queries over UDP (exporter probe)")
 BIND_QUERIES_TCP = Counter("bind_queries_tcp_total", "Total DNS queries over TCP (exporter probe)")
 
-# SERVFAIL
-BIND_SERVFAIL_COUNT = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
+# SERVFAIL metrics
+BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
 BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
@@ -63,7 +63,37 @@ NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 # =========================
 # DNS helpers
 # =========================
-# ... [DNS helpers remain unchanged] ...
+# ... [unchanged DNS helpers] ...
+
+# =========================
+# SERVFAIL tracking
+# =========================
+SERVFAIL_REGEX = re.compile(r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)", re.IGNORECASE)
+last_log_position = 0
+
+def parse_bind_timestamp(date_str):
+    try:
+        return datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S.%f").timestamp()
+    except ValueError:
+        return datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S").timestamp()
+
+def update_servfail_metrics():
+    global last_log_position
+    try:
+        with open(LOG_PATH, "r") as f:
+            f.seek(last_log_position)
+            for line in f:
+                match = SERVFAIL_REGEX.search(line)
+                if match:
+                    date_str = match.group(1)
+                    ts = parse_bind_timestamp(date_str)
+                    BIND_SERVFAIL_TOTAL.inc()
+                    BIND_SERVFAIL_LAST.set(ts)
+            last_log_position = f.tell()
+    except FileNotFoundError:
+        print(f"[servfail] Log file {LOG_PATH} not found")
+    except Exception as e:
+        print(f"[servfail] Error parsing logs: {e}")
 
 # =========================
 # Main loop
