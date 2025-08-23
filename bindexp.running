@@ -207,3 +207,48 @@ def update_system_metrics():
         drift = 0.0
         for line in result.splitlines():
             m = re.search(r"^Last offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s+seconds", line.strip())
+            if m:
+                drift = float(m.group(1))
+                break
+        CHRONYD_DRIFT.set(drift)
+    except Exception:
+        CHRONYD_DRIFT.set(0.0)
+
+# =========================
+# Main loop
+# =========================
+def main():
+    start_http_server(9119, addr="0.0.0.0")
+    print(f"Exporter started on :9119 monitoring {IFACE_NAME}")
+
+    while True:
+        BIND_UP.set(1 if check_bind_health() else 0)
+
+        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+        tcp_result, _, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
+
+        if udp_result:
+            BIND_LATENCY.set(udp_latency)
+            accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
+        else:
+            accuracy = 0
+            BIND_QUERY_FAILS.inc()
+        BIND_RECORD_ACCURACY.set(accuracy)
+
+        if udp_result and tcp_result and set(udp_result) == set(tcp_result):
+            BIND_DIRECT_VS_BGP.set(0)
+        else:
+            BIND_DIRECT_VS_BGP.set(1)
+
+        if udp_err and "DNSSEC" in udp_err.upper():
+            BIND_SECURITY_ERRORS.inc()
+
+        update_system_metrics()
+        update_nic_metrics_ifstat()
+        update_bind_stats()
+        update_servfail_metrics()
+
+        time.sleep(QUERY_INTERVAL)
+
+if __name__ == "__main__":
+    main()
