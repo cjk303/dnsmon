@@ -113,14 +113,14 @@ def update_bind_stats():
                 elem.tag = elem.tag.split('}', 1)[1]
 
         # Cache hit ratio
-        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', xml_text)
-        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', xml_text)
+        hits_match = re.search(r'<counter name=\"CacheHits\">(\d+)</counter>', xml_text)
+        misses_match = re.search(r'<counter name=\"CacheMisses\">(\d+)</counter>', xml_text)
         hits = int(hits_match.group(1)) if hits_match else 0
         misses = int(misses_match.group(1)) if misses_match else 0
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # QryUDP / QryTCP counters (use Gauges for absolute values)
+        # QryUDP / QryTCP counters (Gauges)
         qry_udp = root.find(".//counter[@name='QryUDP']")
         qry_tcp = root.find(".//counter[@name='QryTCP']")
 
@@ -147,10 +147,6 @@ def update_bind_stats():
             BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
-
-    except Exception as e:
-        print(f"[bind-stats] Error: {e}")
-
 # =========================
 # SERVFAIL Metrics
 # =========================
@@ -190,4 +186,76 @@ def update_system_metrics():
         result = subprocess.check_output(["chronyc", "tracking"], text=True, stderr=subprocess.STDOUT)
         drift = 0.0
         for line in result.splitlines():
-            m
+            m = re.search(r"^Last offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s+seconds", line.strip())
+            if m:
+                drift = float(m.group(1))
+                break
+        CHRONYD_DRIFT.set(drift)
+    except Exception:
+        CHRONYD_DRIFT.set(0.0)
+
+def update_memory_metrics():
+    try:
+        result = subprocess.check_output(["free", "-m"], text=True)
+        lines = result.splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            total = int(parts[1])
+            used = int(parts[2])
+            utilization = used / total * 100
+            MEM_UTIL.set(utilization)
+    except Exception as e:
+        print(f"[memory] Error updating memory metrics: {e}")
+        MEM_UTIL.set(0.0)
+
+def update_nic_metrics_ifstat():
+    try:
+        cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
+        raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+        if len(lines) >= 3:
+            value_line = lines[-1].split()
+            rx, tx = float(value_line[0]), float(value_line[1])
+            NIC_RX.set(rx)
+            NIC_TX.set(tx)
+    except Exception as e:
+        print(f"[ifstat] Error: {e}")
+
+# =========================
+# Main Loop
+# =========================
+def main():
+    start_http_server(9119, addr="0.0.0.0")
+    print(f"Exporter started on port 9119, monitoring interface: {IFACE_NAME}")
+
+    while True:
+        BIND_UP.set(1 if check_bind_health() else 0)
+        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+        tcp_result, _, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
+
+        if udp_result:
+            BIND_LATENCY.set(udp_latency)
+            accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
+        else:
+            accuracy = 0
+            BIND_QUERY_FAILS.inc()
+        BIND_RECORD_ACCURACY.set(accuracy)
+
+        if udp_result and tcp_result and set(udp_result) == set(tcp_result):
+            BIND_DIRECT_VS_BGP.set(0)
+        else:
+            BIND_DIRECT_VS_BGP.set(1)
+
+        if udp_err and "DNSSEC" in udp_err.upper():
+            BIND_SECURITY_ERRORS.inc()
+
+        update_system_metrics()
+        update_memory_metrics()
+        update_nic_metrics_ifstat()
+        update_bind_stats()
+        update_servfail_metrics()
+
+        time.sleep(QUERY_INTERVAL)
+
+if __name__ == "__main__":
+    main()
