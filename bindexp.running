@@ -31,7 +31,6 @@ BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
 BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
 BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Difference between direct and BGP VIP query results")
-BIND_QUERIES = Counter("bind_queries_total", "Total DNS queries", ["protocol", "source"])
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers")
@@ -44,6 +43,8 @@ BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone tra
 BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
 BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
 BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
+BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total DNS queries over UDP (from stats)")
+BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (from stats)")
 
 # SERVFAIL metrics
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
@@ -59,12 +60,6 @@ CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in secon
 # NIC metrics
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
-
-# =========================
-# Track last seen values for bind stats
-# =========================
-last_qry_udp = None
-last_qry_tcp = None
 
 # =========================
 # DNS Helpers
@@ -84,10 +79,6 @@ def query_dns(server_ip, hostname, qtype, use_tcp=False):
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
         if size > 1400:
             DNS_EDNS_FRAGMENTED.inc()
-        if use_tcp:
-            BIND_QUERIES.labels(protocol="tcp", source="probe").inc()
-        else:
-            BIND_QUERIES.labels(protocol="udp", source="probe").inc()
         return [str(rdata) for rdata in answers], latency, None
     except dns.resolver.NXDOMAIN:
         return None, None, "NXDOMAIN"
@@ -108,7 +99,6 @@ def check_bind_health():
 # BIND Stats
 # =========================
 def update_bind_stats():
-    global last_qry_udp, last_qry_tcp
     try:
         r = requests.get(BIND_STATS_URL, timeout=3)
         lines = r.text.splitlines()
@@ -130,24 +120,15 @@ def update_bind_stats():
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # QryUDP / QryTCP counters
+        # QryUDP / QryTCP counters (use Gauges for absolute values)
         qry_udp = root.find(".//counter[@name='QryUDP']")
         qry_tcp = root.find(".//counter[@name='QryTCP']")
 
         udp_val = int(qry_udp.text or 0) if qry_udp is not None else 0
         tcp_val = int(qry_tcp.text or 0) if qry_tcp is not None else 0
 
-        if last_qry_udp is not None:
-            delta = udp_val - last_qry_udp
-            if delta > 0:
-                BIND_QUERIES.labels(protocol="udp", source="bindstats").inc(delta)
-        last_qry_udp = udp_val
-
-        if last_qry_tcp is not None:
-            delta = tcp_val - last_qry_tcp
-            if delta > 0:
-                BIND_QUERIES.labels(protocol="tcp", source="bindstats").inc(delta)
-        last_qry_tcp = tcp_val
+        BIND_QUERIES_UDP.set(udp_val)
+        BIND_QUERIES_TCP.set(tcp_val)
 
         # Qtype metrics
         for counter in root.findall(".//counters[@type='qtype']//counter"):
@@ -209,76 +190,4 @@ def update_system_metrics():
         result = subprocess.check_output(["chronyc", "tracking"], text=True, stderr=subprocess.STDOUT)
         drift = 0.0
         for line in result.splitlines():
-            m = re.search(r"^Last offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s+seconds", line.strip())
-            if m:
-                drift = float(m.group(1))
-                break
-        CHRONYD_DRIFT.set(drift)
-    except Exception:
-        CHRONYD_DRIFT.set(0.0)
-
-def update_memory_metrics():
-    try:
-        result = subprocess.check_output(["free", "-m"], text=True)
-        lines = result.splitlines()
-        if len(lines) >= 2:
-            parts = lines[1].split()
-            total = int(parts[1])
-            used = int(parts[2])
-            utilization = used / total * 100
-            MEM_UTIL.set(utilization)
-    except Exception as e:
-        print(f"[memory] Error updating memory metrics: {e}")
-        MEM_UTIL.set(0.0)
-
-def update_nic_metrics_ifstat():
-    try:
-        cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
-        raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
-        if len(lines) >= 3:
-            value_line = lines[-1].split()
-            rx, tx = float(value_line[0]), float(value_line[1])
-            NIC_RX.set(rx)
-            NIC_TX.set(tx)
-    except Exception as e:
-        print(f"[ifstat] Error: {e}")
-
-# =========================
-# Main Loop
-# =========================
-def main():
-    start_http_server(9119, addr="0.0.0.0")
-    print(f"Exporter started on port 9119, monitoring interface: {IFACE_NAME}")
-
-    while True:
-        BIND_UP.set(1 if check_bind_health() else 0)
-        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
-        tcp_result, _, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
-
-        if udp_result:
-            BIND_LATENCY.set(udp_latency)
-            accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
-        else:
-            accuracy = 0
-            BIND_QUERY_FAILS.inc()
-        BIND_RECORD_ACCURACY.set(accuracy)
-
-        if udp_result and tcp_result and set(udp_result) == set(tcp_result):
-            BIND_DIRECT_VS_BGP.set(0)
-        else:
-            BIND_DIRECT_VS_BGP.set(1)
-
-        if udp_err and "DNSSEC" in udp_err.upper():
-            BIND_SECURITY_ERRORS.inc()
-
-        update_system_metrics()
-        update_memory_metrics()
-        update_nic_metrics_ifstat()
-        update_bind_stats()
-        update_servfail_metrics()
-
-        time.sleep(QUERY_INTERVAL)
-
-if __name__ == "__main__":
-    main()
+            m
