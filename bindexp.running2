@@ -127,27 +127,37 @@ def update_bind_stats():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
+        # -------------------------
+        # UDP/TCP total queries
+        # -------------------------
+        BIND_QUERIES_UDP.set(int(root.findtext(".//counter[@name='QryUDP']") or 0))
+        BIND_QUERIES_TCP.set(int(root.findtext(".//counter[@name='QryTCP']") or 0))
+
+        # -------------------------
         # Cache hit ratio
+        # -------------------------
         hits = int(root.findtext(".//counter[@name='CacheHits']") or 0)
         misses = int(root.findtext(".//counter[@name='CacheMisses']") or 0)
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # QryUDP / QryTCP counters
-        BIND_QUERIES_UDP.set(int(root.findtext(".//counter[@name='QryUDP']") or 0))
-        BIND_QUERIES_TCP.set(int(root.findtext(".//counter[@name='QryTCP']") or 0))
-
+        # -------------------------
         # Qtype metrics
+        # -------------------------
         for counter in root.findall(".//counters[@type='qtype']//counter"):
             qtype = counter.attrib.get("name", "UNKNOWN")
             BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(int(counter.text or 0))
 
+        # -------------------------
         # Rcode metrics
+        # -------------------------
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name", "UNKNOWN")
             BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
 
+        # -------------------------
         # Zone metrics
+        # -------------------------
         zones = root.findall(".//zones//zone")
         BIND_ZONE_COUNT.set(len(zones))
         for zone in zones:
@@ -157,15 +167,21 @@ def update_bind_stats():
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
 
+        # -------------------------
         # Truncated responses
+        # -------------------------
         truncated_elem = root.find(".//counter[@name='Truncated']")
         BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text) if truncated_elem is not None and truncated_elem.text else 0)
 
-        # Authoritative vs recursive queries
+        # -------------------------
+        # Authoritative vs Recursive queries
+        # -------------------------
         BIND_QRY_AUTHORITATIVE.set(int(root.findtext(".//counter[@name='QryAuthoritative']") or 0))
         BIND_QRY_RECURSIVE.set(int(root.findtext(".//counter[@name='QryRecursive']") or 0))
 
+        # -------------------------
         # BIND uptime
+        # -------------------------
         BIND_UPTIME.set(int(root.findtext(".//uptime") or 0))
 
     except Exception as e:
@@ -237,7 +253,7 @@ def update_memory_metrics():
         MEM_UTIL.set(mem.percent)
         swap = psutil.swap_memory()
         SWAP_UTIL.set(swap.percent)
-    except Exception as e:
+    except Exception:
         MEM_UTIL.set(0.0)
         SWAP_UTIL.set(0.0)
 
@@ -245,7 +261,7 @@ def update_disk_metrics():
     try:
         usage = psutil.disk_usage(DISK_PATH)
         DISK_UTIL.set(usage.percent)
-    except Exception as e:
+    except Exception:
         DISK_UTIL.set(0.0)
 
 def update_nic_metrics_ifstat():
