@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+import time
+import socket
+import re
+import dns.resolver
+import dns.exception
+import requests
+import xml.etree.ElementTree as ET
+import psutil
+import subprocess
+from datetime import datetime
+from prometheus_client import start_http_server, Gauge, Counter
+
+# =========================
+# Configuration
+# =========================
+DNS_TEST_RECORD = "P054ADSAMDC01.amer.EPIQCORP.COM"
+DNS_TEST_TYPE = "A"
+DIRECT_DNS = "127.0.0.1"
+BGP_DNS = "10.255.0.10"
+QUERY_INTERVAL = 10  # seconds
+BIND_STATS_URL = "http://127.0.0.1:8053/xml/v3"
+EXPECTED_IPS = {"10.35.33.13"}
+IFACE_NAME = "ens33"
+LOG_PATH = "/var/log/named/default.log"
+
+# =========================
+# Prometheus Metrics
+# =========================
+BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
+BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
+BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
+BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Difference between direct and BGP VIP query results")
+BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
+BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
+
+# Truncation metrics
+BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers (last query)")
+BIND_TRUNCATED_TOTAL = Gauge("bind_truncated_total", "Total truncated DNS answers (from BIND stats)")
+
+DNS_ANSWER_SIZE = Gauge("dns_answer_size_bytes", "DNS answer size in bytes")
+DNS_EDNS_FRAGMENTED = Counter("dns_edns_fragmented_total", "Total fragmented EDNS answers")
+BIND_CACHE_HIT_RATIO = Gauge("bind_cache_hit_ratio", "Cache hit ratio")
+BIND_QUERIES_BY_TYPE = Gauge("bind_queries_by_type_total", "DNS queries by type", ["qtype"])
+BIND_RESPONSES_BY_CODE = Gauge("bind_responses_by_rcode_total", "DNS responses by return code", ["rcode"])
+BIND_AXFR_SUCCESSES = Gauge("bind_axfr_success_total", "Successful AXFR zone transfers", ["zone"])
+BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfers", ["zone"])
+BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
+BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
+BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total DNS queries over UDP (from stats)")
+BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (from stats)")
+
+# SERVFAIL metrics
+BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
+BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
+
+# System metrics
+CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
+MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
+FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
+CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
+CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
+
+# NIC metrics
+NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
+NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
+
+# =========================
+# DNS Helpers
+# =========================
+def query_dns(server_ip, hostname, qtype, use_tcp=False):
+    resolver = dns.resolver.Resolver()
+    resolver.nameservers = [server_ip]
+    resolver.timeout = 2
+    resolver.lifetime = 2
+    start_time = time.time()
+    try:
+        answers = resolver.resolve(hostname, qtype, tcp=use_tcp)
+        latency = time.time() - start_time
+        size = sum(len(str(rdata).encode()) for rdata in answers)
+        DNS_ANSWER_SIZE.set(size)
+
+        # Per-query truncation metric
+        truncated = bool(getattr(answers.response, "flags", 0) & 0x200)
+        BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
+
+        if size > 1400:
+            DNS_EDNS_FRAGMENTED.inc()
+        return [str(rdata) for rdata in answers], latency, None
+    except dns.resolver.NXDOMAIN:
+        return None, None, "NXDOMAIN"
+    except dns.resolver.Timeout:
+        return None, None, "TIMEOUT"
+    except dns.exception.DNSException as e:
+        return None, None, str(e)
+
+def check_bind_health():
+    try:
+        sock = socket.create_connection((DIRECT_DNS, 53), timeout=2)
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+# =========================
+# BIND Stats
+# =========================
+def update_bind_stats():
+    try:
+        r = requests.get(BIND_STATS_URL, timeout=3)
+        lines = r.text.splitlines()
+        if len(lines) < 3:
+            print("[bind-stats] Unexpected stats output format")
+            return
+        xml_text = lines[2].strip()
+
+        root = ET.fromstring(xml_text)
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}', 1)[1]
+
+        # Cache hit ratio
+        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', xml_text)
+        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', xml_text)
+        hits = int(hits_match.group(1)) if hits_match else 0
+        misses = int(misses_match.group(1)) if misses_match else 0
+        ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
+        BIND_CACHE_HIT_RATIO.set(ratio)
+
+        # QryUDP / QryTCP counters
+        qry_udp = root.find(".//counter[@name='QryUDP']")
+        qry_tcp = root.find(".//counter[@name='QryTCP']")
+        udp_val = int(qry_udp.text or 0) if qry_udp is not None else 0
+        tcp_val = int(qry_tcp.text or 0) if qry_tcp is not None else 0
+        BIND_QUERIES_UDP.set(udp_val)
+        BIND_QUERIES_TCP.set(tcp_val)
+
+        # Qtype metrics
+        for counter in root.findall(".//counters[@type='qtype']//counter"):
+            qtype = counter.attrib.get("name", "UNKNOWN")
+            BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(int(counter.text or 0))
+
+        # Rcode metrics
+        for counter in root.findall(".//counters[@type='rcode']//counter"):
+            rcode = counter.attrib.get("name", "UNKNOWN")
+            BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
+
+        # Zone metrics
+        for zone in root.findall(".//zones//zone"):
+            zone_name = zone.attrib.get("name", "")
+            BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(int(zone.findtext("axfr-success") or 0))
+            BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
+            BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
+            BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
+
+        # Truncated responses (from BIND stats)
+        truncated_elem = root.find(".//counter[@name='Truncated']")
+        if truncated_elem is not None and truncated_elem.text is not None:
+            BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text))
+
+    except Exception as e:
+        print(f"[bind-stats] Error: {e}")
+
+# =========================
+# SERVFAIL Metrics
+# =========================
+SERVFAIL_REGEX = re.compile(
+    r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)",
+    re.IGNORECASE
+)
+last_log_position = 0
+
+def parse_bind_timestamp(date_str):
+    for fmt in ("%d-%b-%Y %H:%M:%S.%f", "%d-%b-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(date_str, fmt).timestamp()
+        except ValueError:
+            continue
+    return time.time()  # fallback
+
+def update_servfail_metrics():
+    global last_log_position
+    try:
+        with open(LOG_PATH, "r") as f:
+            f.seek(last_log_position)
+            for line in f:
+                match = SERVFAIL_REGEX.search(line)
+                if match:
+                    date_str = match.group(1)
+                    ts = parse_bind_timestamp(date_str)
+                    BIND_SERVFAIL_TOTAL.inc()
+                    BIND_SERVFAIL_LAST.set(ts)
+            last_log_position = f.tell()
+    except FileNotFoundError:
+        print(f"[servfail] Log file not found: {LOG_PATH}")
+    except Exception as e:
+        print(f"[servfail] Error parsing logs: {e}")
+
+# =========================
+# System & NIC Metrics
+# =========================
+def update_system_metrics():
+    CPU_UTIL.set(psutil.cpu_percent())
+    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
+    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
+    try:
+        result = subprocess.check_output(["chronyc", "tracking"], text=True, stderr=subprocess.STDOUT)
+        drift = 0.0
+        for line in result.splitlines():
+            m = re.search(r"^Last offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s+seconds", line.strip())
+            if m:
+                drift = float(m.group(1))
+                break
+        CHRONYD_DRIFT.set(drift)
+    except Exception:
+        CHRONYD_DRIFT.set(0.0)
+
+def update_memory_metrics():
+    try:
+        result = subprocess.check_output(["free", "-m"], text=True)
+        lines = result.splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            total = int(parts[1])
+            used = int(parts[2])
+            utilization = used / total * 100
+            MEM_UTIL.set(utilization)
+    except Exception as e:
+        print(f"[memory] Error updating memory metrics: {e}")
+        MEM_UTIL.set(0.0)
+
+def update_nic_metrics_ifstat():
+    try:
+        cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
+        raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+        if len(lines) >= 3:
+            value_line = lines[-1].split()
+            rx, tx = float(value_line[0]), float(value_line[1])
+            NIC_RX.set(rx)
+            NIC_TX.set(tx)
+    except Exception as e:
+        print(f"[ifstat] Error: {e}")
+
+# =========================
+# Main Loop
+# =========================
+def main():
+    start_http_server(9119, addr="0.0.0.0")
+    print(f"Exporter started on port 9119, monitoring interface: {IFACE_NAME}")
+
+    while True:
+        BIND_UP.set(1 if check_bind_health() else 0)
+        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+        tcp_result, _, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
+
+        if udp_result:
+            BIND_LATENCY.set(udp_latency)
+            accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
+        else:
+            accuracy = 0
+            BIND_QUERY_FAILS.inc()
+        BIND_RECORD_ACCURACY.set(accuracy)
+
+        if udp_result and tcp_result and set(udp_result) == set(tcp_result):
+            BIND_DIRECT_VS_BGP.set(0)
+        else:
+            BIND_DIRECT_VS_BGP.set(1)
+
+        if udp_err and "DNSSEC" in udp_err.upper():
+            BIND_SECURITY_ERRORS.inc()
+
+        update_system_metrics()
+        update_memory_metrics()
+        update_nic_metrics_ifstat()
+        update_bind_stats()
+        update_servfail_metrics()
+
+        time.sleep(QUERY_INTERVAL)
+
+if __name__ == "__main__":
+    main()
