@@ -153,10 +153,9 @@ def update_bind_stats():
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
 
-        # Truncated responses (from BIND stats)
+        # Truncated responses (from BIND stats) - always set
         truncated_elem = root.find(".//counter[@name='Truncated']")
-        if truncated_elem is not None and truncated_elem.text is not None:
-            BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text))
+        BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text) if truncated_elem is not None and truncated_elem.text else 0)
 
     except Exception as e:
         print(f"[bind-stats] Error: {e}")
