@@ -23,6 +23,7 @@ BIND_STATS_URL = "http://127.0.0.1:8053/xml/v3"
 EXPECTED_IPS = {"10.35.33.13"}
 IFACE_NAME = "ens33"
 LOG_PATH = "/var/log/named/default.log"
+DISK_PATH = "/"  # disk to monitor
 
 # =========================
 # Prometheus Metrics
@@ -54,12 +55,21 @@ BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
 BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
-# System metrics
+# New system metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
 MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
+SWAP_UTIL = Gauge("system_swap_utilization_percent", "Swap utilization percentage")
+DISK_UTIL = Gauge("system_disk_utilization_percent", "Disk utilization percentage")
 FRR_STATUS = Gauge("frr_status", "FRR status (1=running, 0=stopped)")
 CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)")
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
+CHRONYD_STRATUM = Gauge("chronyd_stratum", "Chronyd/NTP stratum")
+
+# BIND extra metrics
+BIND_ZONE_COUNT = Gauge("bind_zone_count", "Number of zones currently loaded")
+BIND_UPTIME = Gauge("bind_uptime_seconds", "BIND uptime in seconds")
+BIND_QRY_AUTHORITATIVE = Gauge("bind_queries_authoritative_total", "Total authoritative queries from stats")
+BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive queries from stats")
 
 # NIC metrics
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
@@ -80,7 +90,6 @@ def query_dns(server_ip, hostname, qtype, use_tcp=False):
         size = sum(len(str(rdata).encode()) for rdata in answers)
         DNS_ANSWER_SIZE.set(size)
 
-        # Per-query truncation metric
         truncated = bool(getattr(answers.response, "flags", 0) & 0x200)
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
 
@@ -113,27 +122,20 @@ def update_bind_stats():
             print("[bind-stats] Unexpected stats output format")
             return
         xml_text = lines[2].strip()
-
         root = ET.fromstring(xml_text)
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
         # Cache hit ratio
-        hits_match = re.search(r'<counter name="CacheHits">(\d+)</counter>', xml_text)
-        misses_match = re.search(r'<counter name="CacheMisses">(\d+)</counter>', xml_text)
-        hits = int(hits_match.group(1)) if hits_match else 0
-        misses = int(misses_match.group(1)) if misses_match else 0
+        hits = int(root.findtext(".//counter[@name='CacheHits']") or 0)
+        misses = int(root.findtext(".//counter[@name='CacheMisses']") or 0)
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
         # QryUDP / QryTCP counters
-        qry_udp = root.find(".//counter[@name='QryUDP']")
-        qry_tcp = root.find(".//counter[@name='QryTCP']")
-        udp_val = int(qry_udp.text or 0) if qry_udp is not None else 0
-        tcp_val = int(qry_tcp.text or 0) if qry_tcp is not None else 0
-        BIND_QUERIES_UDP.set(udp_val)
-        BIND_QUERIES_TCP.set(tcp_val)
+        BIND_QUERIES_UDP.set(int(root.findtext(".//counter[@name='QryUDP']") or 0))
+        BIND_QUERIES_TCP.set(int(root.findtext(".//counter[@name='QryTCP']") or 0))
 
         # Qtype metrics
         for counter in root.findall(".//counters[@type='qtype']//counter"):
@@ -146,16 +148,25 @@ def update_bind_stats():
             BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
 
         # Zone metrics
-        for zone in root.findall(".//zones//zone"):
+        zones = root.findall(".//zones//zone")
+        BIND_ZONE_COUNT.set(len(zones))
+        for zone in zones:
             zone_name = zone.attrib.get("name", "")
             BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(int(zone.findtext("axfr-success") or 0))
             BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
 
-        # Truncated responses (from BIND stats) - always set
+        # Truncated responses
         truncated_elem = root.find(".//counter[@name='Truncated']")
         BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text) if truncated_elem is not None and truncated_elem.text else 0)
+
+        # Authoritative vs recursive queries
+        BIND_QRY_AUTHORITATIVE.set(int(root.findtext(".//counter[@name='QryAuthoritative']") or 0))
+        BIND_QRY_RECURSIVE.set(int(root.findtext(".//counter[@name='QryRecursive']") or 0))
+
+        # BIND uptime
+        BIND_UPTIME.set(int(root.findtext(".//uptime") or 0))
 
     except Exception as e:
         print(f"[bind-stats] Error: {e}")
@@ -175,7 +186,7 @@ def parse_bind_timestamp(date_str):
             return datetime.strptime(date_str, fmt).timestamp()
         except ValueError:
             continue
-    return time.time()  # fallback
+    return time.time()
 
 def update_servfail_metrics():
     global last_log_position
@@ -202,31 +213,40 @@ def update_system_metrics():
     CPU_UTIL.set(psutil.cpu_percent())
     FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
     CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
+    # Chrony drift & stratum
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True, stderr=subprocess.STDOUT)
         drift = 0.0
+        stratum = 0
         for line in result.splitlines():
             m = re.search(r"^Last offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s+seconds", line.strip())
             if m:
                 drift = float(m.group(1))
-                break
+            m2 = re.search(r"^Stratum\s*:\s*(\d+)", line.strip())
+            if m2:
+                stratum = int(m2.group(1))
         CHRONYD_DRIFT.set(drift)
+        CHRONYD_STRATUM.set(stratum)
     except Exception:
         CHRONYD_DRIFT.set(0.0)
+        CHRONYD_STRATUM.set(0)
 
 def update_memory_metrics():
     try:
-        result = subprocess.check_output(["free", "-m"], text=True)
-        lines = result.splitlines()
-        if len(lines) >= 2:
-            parts = lines[1].split()
-            total = int(parts[1])
-            used = int(parts[2])
-            utilization = used / total * 100
-            MEM_UTIL.set(utilization)
+        mem = psutil.virtual_memory()
+        MEM_UTIL.set(mem.percent)
+        swap = psutil.swap_memory()
+        SWAP_UTIL.set(swap.percent)
     except Exception as e:
-        print(f"[memory] Error updating memory metrics: {e}")
         MEM_UTIL.set(0.0)
+        SWAP_UTIL.set(0.0)
+
+def update_disk_metrics():
+    try:
+        usage = psutil.disk_usage(DISK_PATH)
+        DISK_UTIL.set(usage.percent)
+    except Exception as e:
+        DISK_UTIL.set(0.0)
 
 def update_nic_metrics_ifstat():
     try:
@@ -271,6 +291,7 @@ def main():
 
         update_system_metrics()
         update_memory_metrics()
+        update_disk_metrics()
         update_nic_metrics_ifstat()
         update_bind_stats()
         update_servfail_metrics()
