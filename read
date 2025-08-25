@@ -1,0 +1,126 @@
+# DNS Prometheus Exporter
+
+This project provides a **Prometheus exporter** for monitoring BIND DNS, Chrony/NTP, system resources, and network interface metrics.  
+It collects statistics via BIND’s XML statistics channel, system utilities, and log parsing, then exposes them on a dedicated HTTP endpoint for Prometheus to scrape.
+
+---
+
+## 📦 Requirements
+
+Install dependencies using **APT**:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-psutil dnsutils ifstat chrony
+```
+
+Then install Python libraries:
+
+```bash
+pip3 install prometheus_client requests dnspython
+```
+
+---
+
+## 📂 Repository
+
+Project GitLab repository:  
+👉 [DNS Prometheus Exporter](https://gitlab.amer.epiqcorp.com/unix-tteam/dns-prometheus-exporter.git)
+
+---
+
+## 🚀 Deployment
+
+The exporter includes a `deploy.sh` script to simplify installation and deployment.
+
+To deploy:
+
+```bash
+./deploy.sh
+```
+
+This will:
+- Install necessary dependencies
+- Place the exporter in `/usr/local/bin`
+- Configure systemd service unit
+- Start the exporter service
+
+---
+
+## 📊 Metrics
+
+The exporter exposes metrics on port **9119** (`http://<server>:9119/metrics`).
+
+### Categories
+
+- **BIND Metrics**
+  - `bind_up` – BIND service availability (1 = up, 0 = down)
+  - `bind_latency_seconds` – DNS query latency
+  - `bind_record_accuracy` – Percentage of expected DNS record matches
+  - `bind_query_failures_total` – Total failed queries (timeouts, NXDOMAIN, etc.)
+  - `bind_security_failures_total` – Total DNSSEC/security validation failures
+  - `bind_truncated_percent` – Percent of truncated DNS responses
+  - `bind_truncated_total` – Total truncated DNS responses (from BIND stats)
+  - `bind_cache_hit_ratio` – Cache hit/miss ratio
+  - `bind_queries_by_type_total{qtype}` – Queries by type
+  - `bind_responses_by_rcode_total{rcode}` – Responses by return code
+  - `bind_queries_udp_total` / `bind_queries_tcp_total` – Total queries over UDP/TCP
+  - `bind_axfr_success_total{zone}` / `bind_axfr_failure_total{zone}` – Zone transfer results
+  - `bind_soa_refresh_seconds{zone}` / `bind_soa_expiry_seconds{zone}` – Zone timers
+  - `bind_zone_count` – Number of configured DNS zones
+  - `bind_recursive_queries_total` / `bind_authoritative_queries_total` – Query mode breakdown
+  - `bind_uptime_seconds` – Uptime of the BIND service
+
+- **SERVFAIL Metrics**
+  - `bind_servfail_total` – Count of SERVFAILs from logs
+  - `bind_servfail_last_timestamp` – Timestamp of the last SERVFAIL
+
+- **System Metrics**
+  - `system_cpu_utilization_percent` – CPU usage
+  - `system_memory_utilization_percent` – Memory usage
+  - `system_swap_utilization_percent` – Swap usage
+  - `system_disk_utilization_percent{mountpoint}` – Disk utilization per mount
+  - `frr_status` – FRR daemon status (1 = running, 0 = stopped)
+  - `chronyd_status` – Chronyd status
+  - `chronyd_time_drift_seconds` – Time drift reported by Chrony
+  - `chronyd_stratum` – NTP stratum (lower = closer to reference clock)
+
+- **Network Metrics**
+  - `system_nic_rx_kbytes_per_sec` – NIC RX throughput
+  - `system_nic_tx_kbytes_per_sec` – NIC TX throughput
+
+---
+
+## 📈 Example Prometheus Queries
+
+- **Truncated responses per hour**
+
+```promql
+increase(bind_truncated_total[1h])
+```
+
+- **Chrony stratum in human-readable form**
+
+```promql
+chronyd_stratum
+```
+
+(Interpretation: 1 = directly synced to reference clock, 2 = one hop away, etc.)
+
+---
+
+## 🛠️ Development & Debugging
+
+Run the exporter manually:
+
+```bash
+python3 dns_exporter.py
+```
+
+Logs will show updates for each metric collection cycle.
+
+---
+
+## 📑 License
+
+Internal use only – Epiq Corp Unix Team.
