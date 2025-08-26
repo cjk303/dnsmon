@@ -29,23 +29,15 @@ DISK_PATH = "/"  # disk to monitor
 # Prometheus Metrics
 # =========================
 BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
-BIND_LATENCY = Gauge("bind_latency_seconds", "Direct DNS query latency in seconds")
-BIND_BGP_LATENCY = Gauge("bind_bgp_latency_seconds", "BGP DNS query latency in seconds")
-BIND_LATENCY_DIFF = Gauge("bind_latency_difference_seconds", "Difference in query latency (direct - BGP)")
+BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds (Direct UDP)")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
-
-# mismatch metrics
-BIND_DIRECT_VS_BGP_MISMATCH = Gauge(
-    "bind_direct_vs_bgp_mismatch",
-    "Mismatch between direct DNS and BGP DNS query results (1=mismatch, 0=match)"
-)
-BIND_DIRECT_VS_BGP_MISMATCHES_TOTAL = Counter(
-    "bind_direct_vs_bgp_mismatches_total",
-    "Total mismatches between direct DNS and BGP DNS query results"
-)
-
+BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Mismatch between direct and BGP query results (0=same, 1=different)")
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
+
+# New metrics
+BIND_DIRECT_VS_BGP_MISMATCH = Counter("bind_direct_vs_bgp_mismatch_total", "Total mismatches between Direct and BGP DNS answers")
+BIND_QUERY_LAT_DIFF = Gauge("bind_query_latency_difference_seconds", "Latency difference between Direct and BGP queries")
 
 # Truncation metrics
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers (last query)")
@@ -273,30 +265,35 @@ def main():
 
     while True:
         BIND_UP.set(1 if check_bind_health() else 0)
-        direct_result, direct_latency, direct_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+
+        # Direct DNS queries (UDP + TCP)
+        direct_udp_result, direct_udp_latency, direct_udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+        direct_tcp_result, direct_tcp_latency, direct_tcp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
+
+        # BGP DNS query (UDP only)
         bgp_result, bgp_latency, bgp_err = query_dns(BGP_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
 
-        if direct_result:
-            BIND_LATENCY.set(direct_latency)
-            accuracy = len(set(direct_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
+        # Record UDP latency as the "main" latency metric
+        if direct_udp_result:
+            BIND_LATENCY.set(direct_udp_latency)
+            accuracy = len(set(direct_udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
         else:
             accuracy = 0
             BIND_QUERY_FAILS.inc()
         BIND_RECORD_ACCURACY.set(accuracy)
 
-        if bgp_result:
-            BIND_BGP_LATENCY.set(bgp_latency)
-
-        if direct_latency is not None and bgp_latency is not None:
-            BIND_LATENCY_DIFF.set(direct_latency - bgp_latency)
-
-        if direct_result and bgp_result and set(direct_result) == set(bgp_result):
-            BIND_DIRECT_VS_BGP_MISMATCH.set(0)
+        # Compare direct UDP vs BGP UDP answers
+        if direct_udp_result and bgp_result and set(direct_udp_result) == set(bgp_result):
+            BIND_DIRECT_VS_BGP.set(0)
         else:
-            BIND_DIRECT_VS_BGP_MISMATCH.set(1)
-            BIND_DIRECT_VS_BGP_MISMATCHES_TOTAL.inc()
+            BIND_DIRECT_VS_BGP.set(1)
+            BIND_DIRECT_VS_BGP_MISMATCH.inc()
 
-        if direct_err and "DNSSEC" in direct_err.upper():
+        # Record latency difference if both succeeded
+        if direct_udp_latency is not None and bgp_latency is not None:
+            BIND_QUERY_LAT_DIFF.set(direct_udp_latency - bgp_latency)
+
+        if direct_udp_err and "DNSSEC" in direct_udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
         update_system_metrics()
