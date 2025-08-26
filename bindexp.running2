@@ -56,7 +56,7 @@ BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
 BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
-# New system metrics
+# System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
 MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
 SWAP_UTIL = Gauge("system_swap_utilization_percent", "Swap utilization percentage")
@@ -261,30 +261,38 @@ def main():
 
     while True:
         BIND_UP.set(1 if check_bind_health() else 0)
-        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
-        tcp_result, tcp_latency, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
 
+        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+        tcp_result, tcp_latency, tcp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
+
+        # Latency & accuracy
         if udp_result:
             BIND_LATENCY.set(udp_latency)
             accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
         else:
             accuracy = 0
-            BIND_QUERY_FAILS.inc()
         BIND_RECORD_ACCURACY.set(accuracy)
 
-        # =============================
-        # FIX: Mismatch counter works
-        # =============================
+        # Count failures
+        if udp_result is None or udp_err:
+            BIND_QUERY_FAILS.inc()
+        if tcp_result is None or tcp_err:
+            BIND_QUERY_FAILS.inc()
+
+        # Count mismatches
         if udp_result and tcp_result:
-            if set(udp_result) == set(tcp_result):
-                BIND_DIRECT_VS_BGP.set(0)
-            else:
+            if set(udp_result) != set(tcp_result):
                 BIND_DIRECT_VS_BGP.set(1)
                 BIND_DIRECT_VS_BGP_MISMATCHES.inc()
+                BIND_QUERY_FAILS.inc()
+            else:
+                BIND_DIRECT_VS_BGP.set(0)
         else:
             BIND_DIRECT_VS_BGP.set(1)
             BIND_DIRECT_VS_BGP_MISMATCHES.inc()
+            BIND_QUERY_FAILS.inc()
 
+        # DNSSEC errors
         if udp_err and "DNSSEC" in udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
