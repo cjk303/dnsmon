@@ -29,9 +29,26 @@ DISK_PATH = "/"  # disk to monitor
 # Prometheus Metrics
 # =========================
 BIND_UP = Gauge("bind_up", "BIND service status (1=up, 0=down)")
-BIND_LATENCY = Gauge("bind_latency_seconds", "DNS query latency in seconds")
 BIND_RECORD_ACCURACY = Gauge("bind_record_accuracy", "Accuracy of DNS records (percentage)")
-BIND_DIRECT_VS_BGP = Gauge("bind_direct_vs_bgp_difference", "Difference between direct and BGP VIP query results")
+
+# DNS latency metrics
+BIND_DIRECT_LATENCY = Gauge("bind_direct_latency_seconds", "Latency of DNS queries to Direct DNS server")
+BIND_BGP_LATENCY = Gauge("bind_bgp_latency_seconds", "Latency of DNS queries to BGP DNS server")
+BIND_DIRECT_VS_BGP_LATENCY_DIFF = Gauge(
+    "bind_direct_vs_bgp_latency_diff_seconds",
+    "Difference in query latency between Direct and BGP DNS (direct - bgp)"
+)
+
+# Mismatch metrics
+BIND_DIRECT_VS_BGP_MISMATCH = Gauge(
+    "bind_direct_vs_bgp_mismatch",
+    "Mismatch between direct DNS and BGP DNS query results (1=mismatch, 0=match)"
+)
+BIND_DIRECT_VS_BGP_MISMATCH_TOTAL = Counter(
+    "bind_direct_vs_bgp_mismatch_total",
+    "Total mismatches between direct DNS and BGP DNS query results"
+)
+
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 
@@ -127,37 +144,22 @@ def update_bind_stats():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
-        # -------------------------
-        # UDP/TCP total queries
-        # -------------------------
         BIND_QUERIES_UDP.set(int(root.findtext(".//counter[@name='QryUDP']") or 0))
         BIND_QUERIES_TCP.set(int(root.findtext(".//counter[@name='QryTCP']") or 0))
 
-        # -------------------------
-        # Cache hit ratio
-        # -------------------------
         hits = int(root.findtext(".//counter[@name='CacheHits']") or 0)
         misses = int(root.findtext(".//counter[@name='CacheMisses']") or 0)
         ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
         BIND_CACHE_HIT_RATIO.set(ratio)
 
-        # -------------------------
-        # Qtype metrics
-        # -------------------------
         for counter in root.findall(".//counters[@type='qtype']//counter"):
             qtype = counter.attrib.get("name", "UNKNOWN")
             BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(int(counter.text or 0))
 
-        # -------------------------
-        # Rcode metrics
-        # -------------------------
         for counter in root.findall(".//counters[@type='rcode']//counter"):
             rcode = counter.attrib.get("name", "UNKNOWN")
             BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
 
-        # -------------------------
-        # Zone metrics
-        # -------------------------
         zones = root.findall(".//zones//zone")
         BIND_ZONE_COUNT.set(len(zones))
         for zone in zones:
@@ -167,21 +169,12 @@ def update_bind_stats():
             BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
             BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
 
-        # -------------------------
-        # Truncated responses
-        # -------------------------
         truncated_elem = root.find(".//counter[@name='Truncated']")
         BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text) if truncated_elem is not None and truncated_elem.text else 0)
 
-        # -------------------------
-        # Authoritative vs Recursive queries
-        # -------------------------
         BIND_QRY_AUTHORITATIVE.set(int(root.findtext(".//counter[@name='QryAuthoritative']") or 0))
         BIND_QRY_RECURSIVE.set(int(root.findtext(".//counter[@name='QryRecursive']") or 0))
 
-        # -------------------------
-        # BIND uptime
-        # -------------------------
         BIND_UPTIME.set(int(root.findtext(".//uptime") or 0))
 
     except Exception as e:
@@ -229,7 +222,6 @@ def update_system_metrics():
     CPU_UTIL.set(psutil.cpu_percent())
     FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
     CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
-    # Chrony drift & stratum
     try:
         result = subprocess.check_output(["chronyc", "tracking"], text=True, stderr=subprocess.STDOUT)
         drift = 0.0
@@ -286,21 +278,35 @@ def main():
 
     while True:
         BIND_UP.set(1 if check_bind_health() else 0)
-        udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
-        tcp_result, _, _ = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
 
-        if udp_result:
-            BIND_LATENCY.set(udp_latency)
-            accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
+        # Compare direct vs BGP
+        direct_result, direct_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+        bgp_result, bgp_latency, _ = query_dns(BGP_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
+
+        # Record latencies
+        if direct_latency is not None:
+            BIND_DIRECT_LATENCY.set(direct_latency)
+        if bgp_latency is not None:
+            BIND_BGP_LATENCY.set(bgp_latency)
+        if direct_latency is not None and bgp_latency is not None:
+            BIND_DIRECT_VS_BGP_LATENCY_DIFF.set(direct_latency - bgp_latency)
+        else:
+            BIND_DIRECT_VS_BGP_LATENCY_DIFF.set(0)
+
+        # Record accuracy
+        if direct_result:
+            accuracy = len(set(direct_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
         else:
             accuracy = 0
             BIND_QUERY_FAILS.inc()
         BIND_RECORD_ACCURACY.set(accuracy)
 
-        if udp_result and tcp_result and set(udp_result) == set(tcp_result):
-            BIND_DIRECT_VS_BGP.set(0)
+        # Mismatch detection
+        if direct_result and bgp_result and set(direct_result) == set(bgp_result):
+            BIND_DIRECT_VS_BGP_MISMATCH.set(0)
         else:
-            BIND_DIRECT_VS_BGP.set(1)
+            BIND_DIRECT_VS_BGP_MISMATCH.set(1)
+            BIND_DIRECT_VS_BGP_MISMATCH_TOTAL.inc()
 
         if udp_err and "DNSSEC" in udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
