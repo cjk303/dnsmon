@@ -72,11 +72,11 @@ BIND_UPTIME = Gauge("bind_uptime_seconds", "BIND uptime in seconds")
 BIND_QRY_AUTHORITATIVE = Gauge("bind_queries_authoritative_total", "Total authoritative queries from stats")
 BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive queries from stats")
 
-# NIC metrics
-NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (psutil)")
-NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (psutil)")
+# NIC metrics (psutil)
+NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s")
+NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s")
 
-# BGP uptime metric
+# BGP uptime
 BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds")
 
 # =========================
@@ -116,90 +116,52 @@ def check_bind_health():
         return False
 
 # =========================
-# BIND Stats
+# BGP Uptime Parser
 # =========================
-def update_bind_stats():
+def parse_bgp_uptime(uptime_str: str) -> int:
+    if not uptime_str or uptime_str.lower() in ("never", "idle", "active", "connect", "opensent", "openconfirm"):
+        return 0
+    uptime_str = uptime_str.strip()
+
+    # Format: 1w2d 03:04:05
+    week_day_match = re.match(r'(?:(\d+)w)?(?:(\d+)d)?\s*(\d{1,2}):(\d{2}):(\d{2})', uptime_str)
+    if week_day_match:
+        weeks = int(week_day_match.group(1) or 0)
+        days = int(week_day_match.group(2) or 0)
+        hours = int(week_day_match.group(3) or 0)
+        minutes = int(week_day_match.group(4) or 0)
+        seconds = int(week_day_match.group(5) or 0)
+        return weeks*7*24*3600 + days*24*3600 + hours*3600 + minutes*60 + seconds
+
+    # Format: hh:mm:ss
+    hms_match = re.match(r'(\d{1,2}):(\d{2}):(\d{2})', uptime_str)
+    if hms_match:
+        hours = int(hms_match.group(1))
+        minutes = int(hms_match.group(2))
+        seconds = int(hms_match.group(3))
+        return hours*3600 + minutes*60 + seconds
+
+    # Compact: 01w3d09h
+    compact_match = re.match(r'(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?', uptime_str)
+    if compact_match:
+        weeks = int(compact_match.group(1) or 0)
+        days = int(compact_match.group(2) or 0)
+        hours = int(compact_match.group(3) or 0)
+        return weeks*7*24*3600 + days*24*3600 + hours*3600
+
+    return 0
+
+def update_bgp_uptime():
     try:
-        r = requests.get(BIND_STATS_URL, timeout=3)
-        lines = r.text.splitlines()
-        if len(lines) < 3:
-            print("[bind-stats] Unexpected stats output format")
-            return
-        xml_text = lines[2].strip()
-        root = ET.fromstring(xml_text)
-        for elem in root.iter():
-            if '}' in elem.tag:
-                elem.tag = elem.tag.split('}', 1)[1]
-
-        BIND_QUERIES_UDP.set(int(root.findtext(".//counter[@name='QryUDP']") or 0))
-        BIND_QUERIES_TCP.set(int(root.findtext(".//counter[@name='QryTCP']") or 0))
-
-        hits = int(root.findtext(".//counter[@name='CacheHits']") or 0)
-        misses = int(root.findtext(".//counter[@name='CacheMisses']") or 0)
-        ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
-        BIND_CACHE_HIT_RATIO.set(ratio)
-
-        for counter in root.findall(".//counters[@type='qtype']//counter"):
-            qtype = counter.attrib.get("name", "UNKNOWN")
-            BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(int(counter.text or 0))
-
-        for counter in root.findall(".//counters[@type='rcode']//counter"):
-            rcode = counter.attrib.get("name", "UNKNOWN")
-            BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
-
-        zones = root.findall(".//zones//zone")
-        BIND_ZONE_COUNT.set(len(zones))
-        for zone in zones:
-            zone_name = zone.attrib.get("name", "")
-            BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(int(zone.findtext("axfr-success") or 0))
-            BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
-            BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
-            BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
-
-        truncated_elem = root.find(".//counter[@name='Truncated']")
-        BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text) if truncated_elem is not None and truncated_elem.text else 0)
-
-        BIND_QRY_AUTHORITATIVE.set(int(root.findtext(".//counter[@name='QryAuthoritative']") or 0))
-        BIND_QRY_RECURSIVE.set(int(root.findtext(".//counter[@name='QryRecursive']") or 0))
-        BIND_UPTIME.set(int(root.findtext(".//uptime") or 0))
-
+        output = subprocess.check_output(
+            "vtysh -c 'show ip bgp sum' | sed -n '9p' | awk '{print $9}'",
+            shell=True, text=True, stderr=subprocess.STDOUT
+        ).strip()
+        uptime_seconds = parse_bgp_uptime(output)
+        BGP_SESSION_UPTIME.set(uptime_seconds)
     except Exception as e:
-        print(f"[bind-stats] Error: {e}")
-
-# =========================
-# SERVFAIL Metrics
-# =========================
-SERVFAIL_REGEX = re.compile(
-    r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)",
-    re.IGNORECASE
-)
-last_log_position = 0
-
-def parse_bind_timestamp(date_str):
-    for fmt in ("%d-%b-%Y %H:%M:%S.%f", "%d-%b-%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(date_str, fmt).timestamp()
-        except ValueError:
-            continue
-    return time.time()
-
-def update_servfail_metrics():
-    global last_log_position
-    try:
-        with open(LOG_PATH, "r") as f:
-            f.seek(last_log_position)
-            for line in f:
-                match = SERVFAIL_REGEX.search(line)
-                if match:
-                    date_str = match.group(1)
-                    ts = parse_bind_timestamp(date_str)
-                    BIND_SERVFAIL_TOTAL.inc()
-                    BIND_SERVFAIL_LAST.set(ts)
-            last_log_position = f.tell()
-    except FileNotFoundError:
-        print(f"[servfail] Log file not found: {LOG_PATH}")
-    except Exception as e:
-        print(f"[servfail] Error parsing logs: {e}")
+        print(f"[bgp-uptime] Error: {e}")
+        BGP_SESSION_UPTIME.set(0)
 
 # =========================
 # System & NIC Metrics
@@ -242,52 +204,19 @@ def update_disk_metrics():
     except Exception:
         DISK_UTIL.set(0.0)
 
-def update_nic_metrics_psutil():
+def update_nic_metrics():
     try:
-        counters1 = psutil.net_io_counters(pernic=True)
-        if IFACE_NAME not in counters1:
-            print(f"[psutil] Interface {IFACE_NAME} not found")
-            return
-        time.sleep(1)
-        counters2 = psutil.net_io_counters(pernic=True)
-        if IFACE_NAME not in counters2:
-            return
-        rx_bytes = counters2[IFACE_NAME].bytes_recv - counters1[IFACE_NAME].bytes_recv
-        tx_bytes = counters2[IFACE_NAME].bytes_sent - counters1[IFACE_NAME].bytes_sent
-        NIC_RX.set(rx_bytes / 1024.0)
-        NIC_TX.set(tx_bytes / 1024.0)
+        io = psutil.net_io_counters(pernic=True)
+        if IFACE_NAME in io:
+            before = io[IFACE_NAME]
+            time.sleep(1)
+            after = psutil.net_io_counters(pernic=True)[IFACE_NAME]
+            rx_kbps = (after.bytes_recv - before.bytes_recv) / 1024.0
+            tx_kbps = (after.bytes_sent - before.bytes_sent) / 1024.0
+            NIC_RX.set(rx_kbps)
+            NIC_TX.set(tx_kbps)
     except Exception as e:
-        print(f"[psutil-nic] Error: {e}")
-
-# =========================
-# BGP Uptime
-# =========================
-def parse_bgp_uptime(uptime_str: str) -> int:
-    total_seconds = 0
-    if not uptime_str or uptime_str == "0":
-        return 0
-    match = re.match(r"(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", uptime_str)
-    if not match:
-        return 0
-    weeks, days, hours, minutes, seconds = match.groups()
-    if weeks:   total_seconds += int(weeks) * 7 * 24 * 3600
-    if days:    total_seconds += int(days) * 24 * 3600
-    if hours:   total_seconds += int(hours) * 3600
-    if minutes: total_seconds += int(minutes) * 60
-    if seconds: total_seconds += int(seconds)
-    return total_seconds
-
-def update_bgp_uptime():
-    try:
-        output = subprocess.check_output(
-            'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
-            shell=True, text=True, stderr=subprocess.STDOUT
-        ).strip()
-        seconds = parse_bgp_uptime(output)
-        BGP_SESSION_UPTIME.set(seconds)
-    except Exception as e:
-        print(f"[bgp-uptime] Error: {e}")
-        BGP_SESSION_UPTIME.set(0)
+        print(f"[nic] Error: {e}")
 
 # =========================
 # Main Loop
@@ -302,7 +231,6 @@ def main():
         udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
         tcp_result, tcp_latency, tcp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
 
-        # Latency & accuracy
         if udp_result:
             BIND_LATENCY.set(udp_latency)
             accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
@@ -310,13 +238,11 @@ def main():
             accuracy = 0
         BIND_RECORD_ACCURACY.set(accuracy)
 
-        # Count failures
         if udp_result is None or udp_err:
             BIND_QUERY_FAILS.inc()
         if tcp_result is None or tcp_err:
             BIND_QUERY_FAILS.inc()
 
-        # Count mismatches
         if udp_result and tcp_result:
             if set(udp_result) != set(tcp_result):
                 BIND_DIRECT_VS_BGP.set(1)
@@ -329,17 +255,14 @@ def main():
             BIND_DIRECT_VS_BGP_MISMATCHES.inc()
             BIND_QUERY_FAILS.inc()
 
-        # DNSSEC errors
         if udp_err and "DNSSEC" in udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
         update_system_metrics()
         update_memory_metrics()
         update_disk_metrics()
-        update_nic_metrics_psutil()
-        update_bind_stats()
-        update_servfail_metrics()
-        update_bgp_uptime()   # <-- new metric
+        update_nic_metrics()
+        update_bgp_uptime()
 
         time.sleep(QUERY_INTERVAL)
 
