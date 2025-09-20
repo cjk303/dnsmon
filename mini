@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import subprocess
+
+try:
+    output = subprocess.check_output(
+        ['vtysh', '-c', 'show ip bgp sum'],
+        text=True,
+        stderr=subprocess.STDOUT
+    )
+    print("Full output:\n", output)
+    # Get 9th line (index 8) and 9th column (index 8)
+    line = output.splitlines()[8]
+    uptime_str = line.split()[8]
+    print("BGP uptime string:", uptime_str)
+except Exception as e:
+    print("Error:", e)
