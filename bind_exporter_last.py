@@ -36,7 +36,6 @@ BIND_DIRECT_VS_BGP_MISMATCHES = Counter("bind_direct_vs_bgp_mismatches_total", "
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 
-# Truncation metrics
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers (last query)")
 BIND_TRUNCATED_TOTAL = Gauge("bind_truncated_total", "Total truncated DNS answers (from BIND stats)")
 
@@ -52,11 +51,9 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total DNS queries over UDP (from stats)")
 BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (from stats)")
 
-# SERVFAIL metrics
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
 BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
-# System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
 MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
 SWAP_UTIL = Gauge("system_swap_utilization_percent", "Swap utilization percentage")
@@ -66,13 +63,11 @@ CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)"
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
 CHRONYD_STRATUM = Gauge("chronyd_stratum", "Chronyd/NTP stratum")
 
-# BIND extra metrics
 BIND_ZONE_COUNT = Gauge("bind_zone_count", "Number of zones currently loaded")
 BIND_UPTIME = Gauge("bind_uptime_seconds", "BIND uptime in seconds")
 BIND_QRY_AUTHORITATIVE = Gauge("bind_queries_authoritative_total", "Total authoritative queries from stats")
 BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive queries from stats")
 
-# NIC metrics
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 
@@ -201,6 +196,8 @@ def update_servfail_metrics():
 # =========================
 # System & NIC Metrics
 # =========================
+_last_nic_counters = None
+_last_nic_time = None
 def update_system_metrics():
     CPU_UTIL.set(psutil.cpu_percent())
     FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
@@ -240,17 +237,23 @@ def update_disk_metrics():
         DISK_UTIL.set(0.0)
 
 def update_nic_metrics_ifstat():
+    """Replaces ifstat with psutil, keeps same metric names."""
+    global _last_nic_counters, _last_nic_time
     try:
-        cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
-        raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
-        if len(lines) >= 3:
-            value_line = lines[-1].split()
-            rx, tx = float(value_line[0]), float(value_line[1])
-            NIC_RX.set(rx)
-            NIC_TX.set(tx)
+        counters = psutil.net_io_counters(pernic=True).get(IFACE_NAME)
+        now = time.time()
+        if counters is None:
+            return
+        if _last_nic_counters is not None and _last_nic_time is not None:
+            interval = now - _last_nic_time
+            rx_kbps = (counters.bytes_recv - _last_nic_counters.bytes_recv) / 1024 / interval
+            tx_kbps = (counters.bytes_sent - _last_nic_counters.bytes_sent) / 1024 / interval
+            NIC_RX.set(rx_kbps)
+            NIC_TX.set(tx_kbps)
+        _last_nic_counters = counters
+        _last_nic_time = now
     except Exception as e:
-        print(f"[ifstat] Error: {e}")
+        print(f"[nic-psutil] Error: {e}")
 
 # =========================
 # Main Loop
