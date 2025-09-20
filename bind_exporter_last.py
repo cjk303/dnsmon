@@ -17,6 +17,7 @@ from prometheus_client import start_http_server, Gauge, Counter
 DNS_TEST_RECORD = "P054ADSAMDC01.amer.EPIQCORP.COM"
 DNS_TEST_TYPE = "A"
 DIRECT_DNS = "127.0.0.1"
+BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/xml/v3"
 EXPECTED_IPS = {"10.35.33.13"}
@@ -35,6 +36,7 @@ BIND_DIRECT_VS_BGP_MISMATCHES = Counter("bind_direct_vs_bgp_mismatches_total", "
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 
+# Truncation metrics
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers (last query)")
 BIND_TRUNCATED_TOTAL = Gauge("bind_truncated_total", "Total truncated DNS answers (from BIND stats)")
 
@@ -50,9 +52,11 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total DNS queries over UDP (from stats)")
 BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (from stats)")
 
+# SERVFAIL metrics
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
 BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
+# System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
 MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
 SWAP_UTIL = Gauge("system_swap_utilization_percent", "Swap utilization percentage")
@@ -62,16 +66,15 @@ CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)"
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
 CHRONYD_STRATUM = Gauge("chronyd_stratum", "Chronyd/NTP stratum")
 
+# BIND extra metrics
 BIND_ZONE_COUNT = Gauge("bind_zone_count", "Number of zones currently loaded")
 BIND_UPTIME = Gauge("bind_uptime_seconds", "BIND uptime in seconds")
 BIND_QRY_AUTHORITATIVE = Gauge("bind_queries_authoritative_total", "Total authoritative queries from stats")
 BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive queries from stats")
 
+# NIC metrics
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
-
-# Single BGP uptime metric (no neighbor)
-BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds")
 
 # =========================
 # DNS Helpers
@@ -117,6 +120,7 @@ def update_bind_stats():
         r = requests.get(BIND_STATS_URL, timeout=3)
         lines = r.text.splitlines()
         if len(lines) < 3:
+            print("[bind-stats] Unexpected stats output format")
             return
         xml_text = lines[2].strip()
         root = ET.fromstring(xml_text)
@@ -235,78 +239,18 @@ def update_disk_metrics():
     except Exception:
         DISK_UTIL.set(0.0)
 
-_last_nic_counters = None
-_last_nic_time = None
 def update_nic_metrics_ifstat():
-    global _last_nic_counters, _last_nic_time
     try:
-        counters = psutil.net_io_counters(pernic=True).get(IFACE_NAME)
-        now = time.time()
-        if counters is None:
-            return
-        if _last_nic_counters is not None and _last_nic_time is not None:
-            interval = now - _last_nic_time
-            rx_kbps = (counters.bytes_recv - _last_nic_counters.bytes_recv) / 1024 / interval
-            tx_kbps = (counters.bytes_sent - _last_nic_counters.bytes_sent) / 1024 / interval
-            NIC_RX.set(rx_kbps)
-            NIC_TX.set(tx_kbps)
-        _last_nic_counters = counters
-        _last_nic_time = now
+        cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
+        raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+        if len(lines) >= 3:
+            value_line = lines[-1].split()
+            rx, tx = float(value_line[0]), float(value_line[1])
+            NIC_RX.set(rx)
+            NIC_TX.set(tx)
     except Exception as e:
-        print(f"[nic-psutil] Error: {e}")
-
-# =========================
-# BGP Session Uptime
-# =========================
-def parse_uptime_to_seconds(uptime_str: str) -> int:
-    total = 0
-    try:
-        # weeks
-        m = re.search(r'(\d+)w', uptime_str)
-        if m: total += int(m.group(1)) * 7 * 86400
-        # days
-        m = re.search(r'(\d+)d', uptime_str)
-        if m: total += int(m.group(1)) * 86400
-        # hours
-        m = re.search(r'(\d+)h', uptime_str)
-        if m: total += int(m.group(1)) * 3600
-        # minutes
-        m = re.search(r'(\d+)m', uptime_str)
-        if m: total += int(m.group(1)) * 60
-        # fallback HH:MM:SS
-        if ':' in uptime_str:
-            parts = uptime_str.split(':')
-            if len(parts) == 3:
-                h, mi, s = map(int, parts)
-                total += h*3600 + mi*60 + s
-            elif len(parts) == 2:
-                mi, s = map(int, parts)
-                total += mi*60 + s
-    except Exception:
-        pass
-    return total
-
-_last_bgp_check = None
-def update_bgp_uptime():
-    global _last_bgp_check
-    now = time.time()
-    if _last_bgp_check is not None and now - _last_bgp_check < 300:
-        return
-    _last_bgp_check = now
-
-    try:
-        # Use exact working shell command
-        output = subprocess.check_output(
-            'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
-            shell=True,
-            text=True,
-            stderr=subprocess.STDOUT,
-        ).strip()
-        uptime_sec = parse_uptime_to_seconds(output)
-        BGP_SESSION_UPTIME.set(uptime_sec)
-    except Exception as e:
-        print(f"[bgp-uptime] Error: {e}")
-        BGP_SESSION_UPTIME.set(0)
+        print(f"[ifstat] Error: {e}")
 
 # =========================
 # Main Loop
@@ -321,6 +265,7 @@ def main():
         udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
         tcp_result, tcp_latency, tcp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
 
+        # Latency & accuracy
         if udp_result:
             BIND_LATENCY.set(udp_latency)
             accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
@@ -328,11 +273,13 @@ def main():
             accuracy = 0
         BIND_RECORD_ACCURACY.set(accuracy)
 
+        # Count failures
         if udp_result is None or udp_err:
             BIND_QUERY_FAILS.inc()
         if tcp_result is None or tcp_err:
             BIND_QUERY_FAILS.inc()
 
+        # Count mismatches
         if udp_result and tcp_result:
             if set(udp_result) != set(tcp_result):
                 BIND_DIRECT_VS_BGP.set(1)
@@ -345,6 +292,7 @@ def main():
             BIND_DIRECT_VS_BGP_MISMATCHES.inc()
             BIND_QUERY_FAILS.inc()
 
+        # DNSSEC errors
         if udp_err and "DNSSEC" in udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
@@ -354,7 +302,6 @@ def main():
         update_nic_metrics_ifstat()
         update_bind_stats()
         update_servfail_metrics()
-        update_bgp_uptime()
 
         time.sleep(QUERY_INTERVAL)
 
