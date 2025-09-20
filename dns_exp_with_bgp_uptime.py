@@ -67,9 +67,10 @@ BIND_UPTIME = Gauge("bind_uptime_seconds", "BIND uptime in seconds")
 BIND_QRY_AUTHORITATIVE = Gauge("bind_queries_authoritative_total", "Total authoritative queries from stats")
 BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive queries from stats")
 
-NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (psutil)")
-NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (psutil)")
+NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
+NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 
+# Single BGP uptime metric (seconds)
 BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds")
 
 # =========================
@@ -86,10 +87,8 @@ def query_dns(server_ip, hostname, qtype, use_tcp=False):
         latency = time.time() - start_time
         size = sum(len(str(rdata).encode()) for rdata in answers)
         DNS_ANSWER_SIZE.set(size)
-
         truncated = bool(getattr(answers.response, "flags", 0) & 0x200)
         BIND_TRUNCATED_PERCENT.set(100 if truncated else 0)
-
         if size > 1400:
             DNS_EDNS_FRAGMENTED.inc()
         return [str(rdata) for rdata in answers], latency, None
@@ -197,9 +196,6 @@ def update_servfail_metrics():
 # =========================
 # System & NIC Metrics
 # =========================
-_last_nic_counters = None
-_last_nic_time = None
-
 def update_system_metrics():
     CPU_UTIL.set(psutil.cpu_percent())
     FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
@@ -238,14 +234,16 @@ def update_disk_metrics():
     except Exception:
         DISK_UTIL.set(0.0)
 
-def update_nic_metrics():
+_last_nic_counters = None
+_last_nic_time = None
+def update_nic_metrics_psutil():
     global _last_nic_counters, _last_nic_time
     try:
         counters = psutil.net_io_counters(pernic=True).get(IFACE_NAME)
         now = time.time()
         if counters is None:
             return
-        if _last_nic_counters is not None and _last_nic_time is not None:
+        if _last_nic_counters and _last_nic_time:
             interval = now - _last_nic_time
             rx_kbps = (counters.bytes_recv - _last_nic_counters.bytes_recv) / 1024 / interval
             tx_kbps = (counters.bytes_sent - _last_nic_counters.bytes_sent) / 1024 / interval
@@ -257,19 +255,18 @@ def update_nic_metrics():
         print(f"[nic-psutil] Error: {e}")
 
 # =========================
-# BGP Session Uptime
+# BGP Uptime Parsing
 # =========================
 def parse_bgp_uptime(uptime_str: str) -> int:
-    """Convert '01w3d08h' format to seconds"""
     total = 0
     try:
-        w = re.search(r'(\d+)w', uptime_str)
-        d = re.search(r'(\d+)d', uptime_str)
-        h = re.search(r'(\d+)h', uptime_str)
+        m = re.search(r'(\d+)w', uptime_str)
+        if m: total += int(m.group(1)) * 7 * 86400
+        m = re.search(r'(\d+)d', uptime_str)
+        if m: total += int(m.group(1)) * 86400
+        m = re.search(r'(\d+)h', uptime_str)
+        if m: total += int(m.group(1)) * 3600
         m = re.search(r'(\d+)m', uptime_str)
-        if w: total += int(w.group(1)) * 7 * 86400
-        if d: total += int(d.group(1)) * 86400
-        if h: total += int(h.group(1)) * 3600
         if m: total += int(m.group(1)) * 60
     except Exception:
         pass
@@ -280,16 +277,22 @@ def update_bgp_uptime():
     global _last_bgp_check
     now = time.time()
     if _last_bgp_check and now - _last_bgp_check < 300:
-        return  # 5 minutes interval
+        return
     _last_bgp_check = now
+
     try:
         output = subprocess.check_output(
-            'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
-            shell=True,
+            ["vtysh", "-c", "show ip bgp sum"],
             text=True,
-            stderr=subprocess.STDOUT,
-        ).strip()
-        BGP_SESSION_UPTIME.set(parse_bgp_uptime(output))
+            stderr=subprocess.STDOUT
+        ).splitlines()
+        if len(output) >= 9:
+            fields = output[8].split()
+            uptime_str = fields[8]  # $9 in awk
+            BGP_SESSION_UPTIME.set(parse_bgp_uptime(uptime_str))
+        else:
+            print(f"[bgp-uptime] Unexpected vtysh output: {output}")
+            BGP_SESSION_UPTIME.set(0)
     except Exception as e:
         print(f"[bgp-uptime] Error: {e}")
         BGP_SESSION_UPTIME.set(0)
@@ -337,7 +340,7 @@ def main():
         update_system_metrics()
         update_memory_metrics()
         update_disk_metrics()
-        update_nic_metrics()
+        update_nic_metrics_psutil()
         update_bind_stats()
         update_servfail_metrics()
         update_bgp_uptime()
