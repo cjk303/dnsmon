@@ -258,8 +258,6 @@ def update_nic_metrics_ifstat():
 # =========================
 # BGP Session Uptime
 # =========================
-_last_bgp_check = None
-
 def parse_uptime_to_seconds(uptime_str: str) -> int:
     total = 0
     try:
@@ -288,6 +286,7 @@ def parse_uptime_to_seconds(uptime_str: str) -> int:
         pass
     return total
 
+_last_bgp_check = None
 def update_bgp_uptime():
     global _last_bgp_check
     now = time.time()
@@ -296,26 +295,15 @@ def update_bgp_uptime():
     _last_bgp_check = now
 
     try:
+        # Use exact working shell command
         output = subprocess.check_output(
-            ["/usr/bin/vtysh", "-c", "show ip bgp sum"],
+            'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
+            shell=True,
             text=True,
             stderr=subprocess.STDOUT,
-        ).splitlines()
-
-        if len(output) < 9:
-            BGP_SESSION_UPTIME.set(0)
-            return
-
-        line = output[8].strip()  # line 9
-        parts = line.split()
-        if len(parts) < 11:
-            BGP_SESSION_UPTIME.set(0)
-            return
-
-        uptime_str = parts[8]  # 9th column
-        uptime_sec = parse_uptime_to_seconds(uptime_str)
+        ).strip()
+        uptime_sec = parse_uptime_to_seconds(output)
         BGP_SESSION_UPTIME.set(uptime_sec)
-
     except Exception as e:
         print(f"[bgp-uptime] Error: {e}")
         BGP_SESSION_UPTIME.set(0)
