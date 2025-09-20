@@ -76,6 +76,9 @@ BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive quer
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 
+# BGP uptime metric
+BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds", ["neighbor"])
+
 # =========================
 # DNS Helpers
 # =========================
@@ -283,6 +286,64 @@ def update_nic_metrics_ifstat():
         print(f"[psutil-nic] Error: {e}")
 
 # =========================
+# BGP Session Uptime
+# =========================
+def parse_uptime_to_seconds(uptime_str: str) -> int:
+    """
+    Convert FRR BGP uptime formats into seconds.
+    Supports:
+      - '00:15:03'
+      - '3d12h45m'
+    Returns 0 if parsing fails.
+    """
+    try:
+        if ":" in uptime_str:  # Format HH:MM:SS or MM:SS
+            parts = uptime_str.split(":")
+            if len(parts) == 3:
+                h, m, s = map(int, parts)
+                return h * 3600 + m * 60 + s
+            elif len(parts) == 2:
+                m, s = map(int, parts)
+                return m * 60 + s
+        else:  # Format like '3d12h45m'
+            total = 0
+            m = re.match(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?", uptime_str)
+            if m:
+                days = int(m.group(1)) if m.group(1) else 0
+                hours = int(m.group(2)) if m.group(2) else 0
+                mins = int(m.group(3)) if m.group(3) else 0
+                total = days * 86400 + hours * 3600 + mins * 60
+            return total
+    except Exception:
+        return 0
+    return 0
+
+_last_bgp_check = 0
+def update_bgp_uptime():
+    global _last_bgp_check
+    now = time.time()
+    if now - _last_bgp_check < 300:  # every 5 minutes
+        return
+    _last_bgp_check = now
+
+    try:
+        output = subprocess.check_output(
+            ["vtysh", "-c", "show ip bgp sum"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        for line in output.splitlines():
+            if re.match(r"^\d+\.\d+\.\d+\.\d+", line):  # starts with neighbor IP
+                parts = line.split()
+                if len(parts) >= 9:
+                    neighbor = parts[0]
+                    uptime_str = parts[8]
+                    uptime_sec = parse_uptime_to_seconds(uptime_str)
+                    BGP_SESSION_UPTIME.labels(neighbor=neighbor).set(uptime_sec)
+    except Exception as e:
+        print(f"[bgp-uptime] Error: {e}")
+
+# =========================
 # Main Loop
 # =========================
 def main():
@@ -320,18 +381,15 @@ def main():
         else:
             BIND_DIRECT_VS_BGP.set(1)
             BIND_DIRECT_VS_BGP_MISMATCHES.inc()
-            BIND_QUERY_FAILS.inc()
 
-        # DNSSEC errors
-        if udp_err and "DNSSEC" in udp_err.upper():
-            BIND_SECURITY_ERRORS.inc()
-
+        # Update all metrics
+        update_bind_stats()
+        update_servfail_metrics()
         update_system_metrics()
         update_memory_metrics()
         update_disk_metrics()
         update_nic_metrics_ifstat()
-        update_bind_stats()
-        update_servfail_metrics()
+        update_bgp_uptime()
 
         time.sleep(QUERY_INTERVAL)
 
