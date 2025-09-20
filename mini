@@ -1,53 +1,21 @@
-#!/usr/bin/env python3
-import time
-import re
-import subprocess
-from prometheus_client import start_http_server, Gauge
-
-# Prometheus metric
-BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds")
-
 def parse_bgp_uptime(uptime_str: str) -> int:
-    """
-    Parse BGP uptime strings like '01w3d08h', '2d04h12m', '5h12m30s' into seconds.
-    """
-    total_seconds = 0
-    if not uptime_str or uptime_str == "0":
+    if not uptime_str or uptime_str.lower() in ("never", "idle", "active", "connect", "opensent", "openconfirm"):
         return 0
-
-    match = re.match(r"(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", uptime_str)
-    if not match:
-        return 0
-
-    weeks, days, hours, minutes, seconds = match.groups()
-    if weeks:   total_seconds += int(weeks) * 7 * 24 * 3600
-    if days:    total_seconds += int(days) * 24 * 3600
-    if hours:   total_seconds += int(hours) * 3600
-    if minutes: total_seconds += int(minutes) * 60
-    if seconds: total_seconds += int(seconds)
-
-    return total_seconds
-
-def update_bgp_uptime():
-    try:
-        output = subprocess.check_output(
-            'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
-            shell=True, text=True, stderr=subprocess.STDOUT
-        ).strip()
-        print(f"[DEBUG] Raw BGP uptime output: '{output}'")
-        seconds = parse_bgp_uptime(output)
-        print(f"[DEBUG] Parsed uptime (seconds): {seconds}")
-        BGP_SESSION_UPTIME.set(seconds)
-    except Exception as e:
-        print(f"[bgp-uptime] Error: {e}")
-        BGP_SESSION_UPTIME.set(0)
-
-def main():
-    start_http_server(9120, addr="0.0.0.0")  # run on different port than main exporter
-    print("Test BGP exporter started on port 9120")
-    while True:
-        update_bgp_uptime()
-        time.sleep(15)  # refresh every 15s
-
-if __name__ == "__main__":
-    main()
+    uptime_str = uptime_str.strip()
+    # Match formats like '1w2d 03:04:05', '2d 12:34:56', '00:12:34'
+    week_day_match = re.match(r'(?:(\d+)w)?(?:(\d+)d)?\s*(\d{1,2}):(\d{2}):(\d{2})', uptime_str)
+    if week_day_match:
+        weeks = int(week_day_match.group(1) or 0)
+        days = int(week_day_match.group(2) or 0)
+        hours = int(week_day_match.group(3) or 0)
+        minutes = int(week_day_match.group(4) or 0)
+        seconds = int(week_day_match.group(5) or 0)
+        return weeks*7*24*3600 + days*24*3600 + hours*3600 + minutes*60 + seconds
+    # Match formats like '00:12:34'
+    hms_match = re.match(r'(\d{1,2}):(\d{2}):(\d{2})', uptime_str)
+    if hms_match:
+        hours = int(hms_match.group(1))
+        minutes = int(hms_match.group(2))
+        seconds = int(hms_match.group(3))
+        return hours*3600 + minutes*60 + seconds
+    return 0
