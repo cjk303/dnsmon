@@ -70,8 +70,8 @@ BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive quer
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 
-# Single BGP uptime metric (no neighbor)
-BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds")
+# Single BGP uptime metric in minutes
+BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_minutes", "BGP session uptime in minutes")
 
 # =========================
 # DNS Helpers
@@ -110,131 +110,51 @@ def check_bind_health():
         return False
 
 # =========================
-# BIND Stats
+# BGP Uptime Parsing
 # =========================
-def update_bind_stats():
+def parse_uptime_to_minutes(uptime_str: str) -> int:
+    total_minutes = 0
     try:
-        r = requests.get(BIND_STATS_URL, timeout=3)
-        lines = r.text.splitlines()
-        if len(lines) < 3:
+        m = re.search(r'(\d+)w', uptime_str)
+        if m: total_minutes += int(m.group(1)) * 7 * 24 * 60
+        m = re.search(r'(\d+)d', uptime_str)
+        if m: total_minutes += int(m.group(1)) * 24 * 60
+        m = re.search(r'(\d+)h', uptime_str)
+        if m: total_minutes += int(m.group(1)) * 60
+        m = re.search(r'(\d+)m', uptime_str)
+        if m: total_minutes += int(m.group(1))
+    except Exception:
+        pass
+    return total_minutes
+
+_last_bgp_check = None
+def update_bgp_uptime():
+    global _last_bgp_check
+    now = time.time()
+    if _last_bgp_check is not None and now - _last_bgp_check < 300:
+        return
+    _last_bgp_check = now
+
+    try:
+        output = subprocess.check_output(
+            ["/usr/bin/vtysh", "-c", "show ip bgp sum"],
+            text=True,
+            stderr=subprocess.STDOUT
+        ).splitlines()
+        lines = [l for l in output if l.strip()]
+        if len(lines) < 9:
+            BGP_SESSION_UPTIME.set(0)
             return
-        xml_text = lines[2].strip()
-        root = ET.fromstring(xml_text)
-        for elem in root.iter():
-            if '}' in elem.tag:
-                elem.tag = elem.tag.split('}', 1)[1]
-
-        BIND_QUERIES_UDP.set(int(root.findtext(".//counter[@name='QryUDP']") or 0))
-        BIND_QUERIES_TCP.set(int(root.findtext(".//counter[@name='QryTCP']") or 0))
-
-        hits = int(root.findtext(".//counter[@name='CacheHits']") or 0)
-        misses = int(root.findtext(".//counter[@name='CacheMisses']") or 0)
-        ratio = hits / (hits + misses) if (hits + misses) > 0 else 0.0
-        BIND_CACHE_HIT_RATIO.set(ratio)
-
-        for counter in root.findall(".//counters[@type='qtype']//counter"):
-            qtype = counter.attrib.get("name", "UNKNOWN")
-            BIND_QUERIES_BY_TYPE.labels(qtype=qtype).set(int(counter.text or 0))
-
-        for counter in root.findall(".//counters[@type='rcode']//counter"):
-            rcode = counter.attrib.get("name", "UNKNOWN")
-            BIND_RESPONSES_BY_CODE.labels(rcode=rcode).set(int(counter.text or 0))
-
-        zones = root.findall(".//zones//zone")
-        BIND_ZONE_COUNT.set(len(zones))
-        for zone in zones:
-            zone_name = zone.attrib.get("name", "")
-            BIND_AXFR_SUCCESSES.labels(zone=zone_name).set(int(zone.findtext("axfr-success") or 0))
-            BIND_AXFR_FAILURES.labels(zone=zone_name).set(int(zone.findtext("axfr-failure") or 0))
-            BIND_SOA_REFRESH.labels(zone=zone_name).set(int(zone.findtext("refresh") or 0))
-            BIND_SOA_EXPIRY.labels(zone=zone_name).set(int(zone.findtext("expiry") or 0))
-
-        truncated_elem = root.find(".//counter[@name='Truncated']")
-        BIND_TRUNCATED_TOTAL.set(int(truncated_elem.text) if truncated_elem is not None and truncated_elem.text else 0)
-
-        BIND_QRY_AUTHORITATIVE.set(int(root.findtext(".//counter[@name='QryAuthoritative']") or 0))
-        BIND_QRY_RECURSIVE.set(int(root.findtext(".//counter[@name='QryRecursive']") or 0))
-        BIND_UPTIME.set(int(root.findtext(".//uptime") or 0))
-
+        uptime_str = lines[8].split()[8]  # line 9, column 9
+        minutes = parse_uptime_to_minutes(uptime_str)
+        BGP_SESSION_UPTIME.set(minutes)
     except Exception as e:
-        print(f"[bind-stats] Error: {e}")
+        print(f"[bgp-uptime] Error: {e}")
+        BGP_SESSION_UPTIME.set(0)
 
 # =========================
-# SERVFAIL Metrics
+# NIC Metrics
 # =========================
-SERVFAIL_REGEX = re.compile(
-    r"(\d{1,2}-[A-Z][a-z]{2}-\d{4} \d{2}:\d{2}:\d{2}(?:\.\d+)?) .*query failed \(SERVFAIL\)",
-    re.IGNORECASE
-)
-last_log_position = 0
-
-def parse_bind_timestamp(date_str):
-    for fmt in ("%d-%b-%Y %H:%M:%S.%f", "%d-%b-%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(date_str, fmt).timestamp()
-        except ValueError:
-            continue
-    return time.time()
-
-def update_servfail_metrics():
-    global last_log_position
-    try:
-        with open(LOG_PATH, "r") as f:
-            f.seek(last_log_position)
-            for line in f:
-                match = SERVFAIL_REGEX.search(line)
-                if match:
-                    date_str = match.group(1)
-                    ts = parse_bind_timestamp(date_str)
-                    BIND_SERVFAIL_TOTAL.inc()
-                    BIND_SERVFAIL_LAST.set(ts)
-            last_log_position = f.tell()
-    except FileNotFoundError:
-        print(f"[servfail] Log file not found: {LOG_PATH}")
-    except Exception as e:
-        print(f"[servfail] Error parsing logs: {e}")
-
-# =========================
-# System & NIC Metrics
-# =========================
-def update_system_metrics():
-    CPU_UTIL.set(psutil.cpu_percent())
-    FRR_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "frr"]) == 0 else 0)
-    CHRONYD_STATUS.set(1 if subprocess.call(["systemctl", "is-active", "--quiet", "chronyd"]) == 0 else 0)
-    try:
-        result = subprocess.check_output(["chronyc", "tracking"], text=True, stderr=subprocess.STDOUT)
-        drift = 0.0
-        stratum = 0
-        for line in result.splitlines():
-            m = re.search(r"^Last offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s+seconds", line.strip())
-            if m:
-                drift = float(m.group(1))
-            m2 = re.search(r"^Stratum\s*:\s*(\d+)", line.strip())
-            if m2:
-                stratum = int(m2.group(1))
-        CHRONYD_DRIFT.set(drift)
-        CHRONYD_STRATUM.set(stratum)
-    except Exception:
-        CHRONYD_DRIFT.set(0.0)
-        CHRONYD_STRATUM.set(0)
-
-def update_memory_metrics():
-    try:
-        mem = psutil.virtual_memory()
-        MEM_UTIL.set(mem.percent)
-        swap = psutil.swap_memory()
-        SWAP_UTIL.set(swap.percent)
-    except Exception:
-        MEM_UTIL.set(0.0)
-        SWAP_UTIL.set(0.0)
-
-def update_disk_metrics():
-    try:
-        usage = psutil.disk_usage(DISK_PATH)
-        DISK_UTIL.set(usage.percent)
-    except Exception:
-        DISK_UTIL.set(0.0)
-
 _last_nic_counters = None
 _last_nic_time = None
 def update_nic_metrics_ifstat():
@@ -254,59 +174,6 @@ def update_nic_metrics_ifstat():
         _last_nic_time = now
     except Exception as e:
         print(f"[nic-psutil] Error: {e}")
-
-# =========================
-# BGP Session Uptime
-# =========================
-def parse_uptime_to_seconds(uptime_str: str) -> int:
-    total = 0
-    try:
-        # weeks
-        m = re.search(r'(\d+)w', uptime_str)
-        if m: total += int(m.group(1)) * 7 * 86400
-        # days
-        m = re.search(r'(\d+)d', uptime_str)
-        if m: total += int(m.group(1)) * 86400
-        # hours
-        m = re.search(r'(\d+)h', uptime_str)
-        if m: total += int(m.group(1)) * 3600
-        # minutes
-        m = re.search(r'(\d+)m', uptime_str)
-        if m: total += int(m.group(1)) * 60
-        # fallback HH:MM:SS
-        if ':' in uptime_str:
-            parts = uptime_str.split(':')
-            if len(parts) == 3:
-                h, mi, s = map(int, parts)
-                total += h*3600 + mi*60 + s
-            elif len(parts) == 2:
-                mi, s = map(int, parts)
-                total += mi*60 + s
-    except Exception:
-        pass
-    return total
-
-_last_bgp_check = None
-def update_bgp_uptime():
-    global _last_bgp_check
-    now = time.time()
-    if _last_bgp_check is not None and now - _last_bgp_check < 300:
-        return
-    _last_bgp_check = now
-
-    try:
-        # Use exact working shell command
-        output = subprocess.check_output(
-            'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
-            shell=True,
-            text=True,
-            stderr=subprocess.STDOUT,
-        ).strip()
-        uptime_sec = parse_uptime_to_seconds(output)
-        BGP_SESSION_UPTIME.set(uptime_sec)
-    except Exception as e:
-        print(f"[bgp-uptime] Error: {e}")
-        BGP_SESSION_UPTIME.set(0)
 
 # =========================
 # Main Loop
@@ -348,14 +215,8 @@ def main():
         if udp_err and "DNSSEC" in udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
-        update_system_metrics()
-        update_memory_metrics()
-        update_disk_metrics()
         update_nic_metrics_ifstat()
-        update_bind_stats()
-        update_servfail_metrics()
         update_bgp_uptime()
-
         time.sleep(QUERY_INTERVAL)
 
 if __name__ == "__main__":
