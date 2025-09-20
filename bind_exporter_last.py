@@ -17,7 +17,6 @@ from prometheus_client import start_http_server, Gauge, Counter
 DNS_TEST_RECORD = "P054ADSAMDC01.amer.EPIQCORP.COM"
 DNS_TEST_TYPE = "A"
 DIRECT_DNS = "127.0.0.1"
-BGP_DNS = "10.255.0.10"
 QUERY_INTERVAL = 10  # seconds
 BIND_STATS_URL = "http://127.0.0.1:8053/xml/v3"
 EXPECTED_IPS = {"10.35.33.13"}
@@ -36,7 +35,6 @@ BIND_DIRECT_VS_BGP_MISMATCHES = Counter("bind_direct_vs_bgp_mismatches_total", "
 BIND_QUERY_FAILS = Counter("bind_query_failures_total", "Total DNS query failures")
 BIND_SECURITY_ERRORS = Counter("bind_security_failures_total", "DNSSEC or security validation failures")
 
-# Truncation metrics
 BIND_TRUNCATED_PERCENT = Gauge("bind_truncated_percent", "Percentage of truncated DNS answers (last query)")
 BIND_TRUNCATED_TOTAL = Gauge("bind_truncated_total", "Total truncated DNS answers (from BIND stats)")
 
@@ -52,11 +50,9 @@ BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 BIND_QUERIES_UDP = Gauge("bind_queries_udp_total", "Total DNS queries over UDP (from stats)")
 BIND_QUERIES_TCP = Gauge("bind_queries_tcp_total", "Total DNS queries over TCP (from stats)")
 
-# SERVFAIL metrics
 BIND_SERVFAIL_TOTAL = Counter("bind_servfail_total", "Total SERVFAIL events found in logs")
 BIND_SERVFAIL_LAST = Gauge("bind_servfail_last_timestamp", "Timestamp of last SERVFAIL event (Unix epoch seconds)")
 
-# System metrics
 CPU_UTIL = Gauge("system_cpu_utilization_percent", "CPU utilization percentage")
 MEM_UTIL = Gauge("system_memory_utilization_percent", "Memory utilization percentage")
 SWAP_UTIL = Gauge("system_swap_utilization_percent", "Swap utilization percentage")
@@ -66,18 +62,16 @@ CHRONYD_STATUS = Gauge("chronyd_status", "Chronyd status (1=running, 0=stopped)"
 CHRONYD_DRIFT = Gauge("chronyd_time_drift_seconds", "Chronyd time drift in seconds (Last offset)")
 CHRONYD_STRATUM = Gauge("chronyd_stratum", "Chronyd/NTP stratum")
 
-# BIND extra metrics
 BIND_ZONE_COUNT = Gauge("bind_zone_count", "Number of zones currently loaded")
 BIND_UPTIME = Gauge("bind_uptime_seconds", "BIND uptime in seconds")
 BIND_QRY_AUTHORITATIVE = Gauge("bind_queries_authoritative_total", "Total authoritative queries from stats")
 BIND_QRY_RECURSIVE = Gauge("bind_queries_recursive_total", "Total recursive queries from stats")
 
-# NIC metrics
 NIC_RX = Gauge("system_nic_rx_kbytes_per_sec", "NIC RX KB/s (ifstat)")
 NIC_TX = Gauge("system_nic_tx_kbytes_per_sec", "NIC TX KB/s (ifstat)")
 
-# BGP uptime metric
-BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds", ["neighbor"])
+# Single BGP uptime metric (no neighbor)
+BGP_SESSION_UPTIME = Gauge("bgp_session_uptime_seconds", "BGP session uptime in seconds")
 
 # =========================
 # DNS Helpers
@@ -123,7 +117,6 @@ def update_bind_stats():
         r = requests.get(BIND_STATS_URL, timeout=3)
         lines = r.text.splitlines()
         if len(lines) < 3:
-            print("[bind-stats] Unexpected stats output format")
             return
         xml_text = lines[2].strip()
         root = ET.fromstring(xml_text)
@@ -242,29 +235,9 @@ def update_disk_metrics():
     except Exception:
         DISK_UTIL.set(0.0)
 
-# --- OLD ifstat implementation (disabled) ---
-# def update_nic_metrics_ifstat():
-#     try:
-#         cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
-#         raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-#         lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
-#         if len(lines) >= 3:
-#             value_line = lines[-1].split()
-#             rx, tx = float(value_line[0]), float(value_line[1])
-#             NIC_RX.set(rx)
-#             NIC_TX.set(tx)
-#     except Exception as e:
-#         print(f"[ifstat] Error: {e}")
-
-# --- NEW psutil-based replacement ---
 _last_nic_counters = None
 _last_nic_time = None
-
 def update_nic_metrics_ifstat():
-    """
-    Replacement for the ifstat-based NIC metrics using psutil.
-    Keeps the same metric names and units (KB/s).
-    """
     global _last_nic_counters, _last_nic_time
     try:
         counters = psutil.net_io_counters(pernic=True).get(IFACE_NAME)
@@ -288,33 +261,34 @@ def update_nic_metrics_ifstat():
 _last_bgp_check = None
 
 def parse_uptime_to_seconds(uptime_str: str) -> int:
+    total = 0
     try:
-        if ":" in uptime_str:  # HH:MM:SS
-            parts = uptime_str.split(":")
+        # weeks
+        m = re.search(r'(\d+)w', uptime_str)
+        if m: total += int(m.group(1)) * 7 * 86400
+        # days
+        m = re.search(r'(\d+)d', uptime_str)
+        if m: total += int(m.group(1)) * 86400
+        # hours
+        m = re.search(r'(\d+)h', uptime_str)
+        if m: total += int(m.group(1)) * 3600
+        # minutes
+        m = re.search(r'(\d+)m', uptime_str)
+        if m: total += int(m.group(1)) * 60
+        # fallback HH:MM:SS
+        if ':' in uptime_str:
+            parts = uptime_str.split(':')
             if len(parts) == 3:
-                h, m, s = map(int, parts)
-                return h * 3600 + m * 60 + s
+                h, mi, s = map(int, parts)
+                total += h*3600 + mi*60 + s
             elif len(parts) == 2:
-                m, s = map(int, parts)
-                return m * 60 + s
-        else:  # 3d12h45m
-            total = 0
-            m = re.match(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?", uptime_str)
-            if m:
-                days = int(m.group(1)) if m.group(1) else 0
-                hours = int(m.group(2)) if m.group(2) else 0
-                mins = int(m.group(3)) if m.group(3) else 0
-                total = days * 86400 + hours * 3600 + mins * 60
-            return total
+                mi, s = map(int, parts)
+                total += mi*60 + s
     except Exception:
-        return 0
-    return 0
+        pass
+    return total
 
 def update_bgp_uptime():
-    """
-    Query vtysh for BGP session summary and set Prometheus metric.
-    Updates every 5 minutes, but exposes the metric immediately on first run.
-    """
     global _last_bgp_check
     now = time.time()
     if _last_bgp_check is not None and now - _last_bgp_check < 300:
@@ -323,27 +297,28 @@ def update_bgp_uptime():
 
     try:
         output = subprocess.check_output(
-            ["vtysh", "-c", "show ip bgp sum"],
+            ["/usr/bin/vtysh", "-c", "show ip bgp sum"],
             text=True,
             stderr=subprocess.STDOUT,
-        )
-        any_set = False
-        for line in output.splitlines():
-            line = line.strip()
-            if not line or not re.match(r"^\d+\.\d+\.\d+\.\d+", line):
-                continue
-            parts = line.split()
-            if len(parts) >= 9:
-                neighbor = parts[0]
-                uptime_str = parts[8]
-                uptime_sec = parse_uptime_to_seconds(uptime_str)
-                BGP_SESSION_UPTIME.labels(neighbor=neighbor).set(uptime_sec)
-                any_set = True
-        if not any_set:
-            BGP_SESSION_UPTIME.labels(neighbor="none").set(0)
+        ).splitlines()
+
+        if len(output) < 9:
+            BGP_SESSION_UPTIME.set(0)
+            return
+
+        line = output[8].strip()  # line 9
+        parts = line.split()
+        if len(parts) < 11:
+            BGP_SESSION_UPTIME.set(0)
+            return
+
+        uptime_str = parts[8]  # 9th column
+        uptime_sec = parse_uptime_to_seconds(uptime_str)
+        BGP_SESSION_UPTIME.set(uptime_sec)
+
     except Exception as e:
         print(f"[bgp-uptime] Error: {e}")
-        BGP_SESSION_UPTIME.labels(neighbor="error").set(0)
+        BGP_SESSION_UPTIME.set(0)
 
 # =========================
 # Main Loop
@@ -385,7 +360,6 @@ def main():
         if udp_err and "DNSSEC" in udp_err.upper():
             BIND_SECURITY_ERRORS.inc()
 
-        # Update metrics
         update_system_metrics()
         update_memory_metrics()
         update_disk_metrics()
