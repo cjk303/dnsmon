@@ -239,18 +239,48 @@ def update_disk_metrics():
     except Exception:
         DISK_UTIL.set(0.0)
 
+# --- OLD ifstat implementation (disabled) ---
+# def update_nic_metrics_ifstat():
+#     try:
+#         cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
+#         raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+#         lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+#         if len(lines) >= 3:
+#             value_line = lines[-1].split()
+#             rx, tx = float(value_line[0]), float(value_line[1])
+#             NIC_RX.set(rx)
+#             NIC_TX.set(tx)
+#     except Exception as e:
+#         print(f"[ifstat] Error: {e}")
+
+# --- NEW psutil-based replacement ---
+_last_nic_counters = None
+_last_nic_time = None
+
 def update_nic_metrics_ifstat():
+    """
+    Replacement for the ifstat-based NIC metrics using psutil.
+    Keeps the same metric names and units (KB/s).
+    """
+    global _last_nic_counters, _last_nic_time
     try:
-        cmd = ["ifstat", "-i", IFACE_NAME, "1", "1"]
-        raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
-        if len(lines) >= 3:
-            value_line = lines[-1].split()
-            rx, tx = float(value_line[0]), float(value_line[1])
-            NIC_RX.set(rx)
-            NIC_TX.set(tx)
+        counters = psutil.net_io_counters(pernic=True).get(IFACE_NAME)
+        if counters is None:
+            return
+
+        now = time.time()
+        if _last_nic_counters is not None and _last_nic_time is not None:
+            elapsed = now - _last_nic_time
+            if elapsed > 0:
+                rx_kbps = (counters.bytes_recv - _last_nic_counters.bytes_recv) / 1024.0 / elapsed
+                tx_kbps = (counters.bytes_sent - _last_nic_counters.bytes_sent) / 1024.0 / elapsed
+                NIC_RX.set(rx_kbps)
+                NIC_TX.set(tx_kbps)
+
+        _last_nic_counters = counters
+        _last_nic_time = now
     except Exception as e:
-        print(f"[ifstat] Error: {e}")
+        print(f"[psutil-nic] Error: {e}")
 
 # =========================
 # Main Loop
