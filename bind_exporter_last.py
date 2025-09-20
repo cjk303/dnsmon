@@ -268,36 +268,28 @@ def update_nic_metrics_ifstat():
     global _last_nic_counters, _last_nic_time
     try:
         counters = psutil.net_io_counters(pernic=True).get(IFACE_NAME)
+        now = time.time()
         if counters is None:
             return
-
-        now = time.time()
         if _last_nic_counters is not None and _last_nic_time is not None:
-            elapsed = now - _last_nic_time
-            if elapsed > 0:
-                rx_kbps = (counters.bytes_recv - _last_nic_counters.bytes_recv) / 1024.0 / elapsed
-                tx_kbps = (counters.bytes_sent - _last_nic_counters.bytes_sent) / 1024.0 / elapsed
-                NIC_RX.set(rx_kbps)
-                NIC_TX.set(tx_kbps)
-
+            interval = now - _last_nic_time
+            rx_kbps = (counters.bytes_recv - _last_nic_counters.bytes_recv) / 1024 / interval
+            tx_kbps = (counters.bytes_sent - _last_nic_counters.bytes_sent) / 1024 / interval
+            NIC_RX.set(rx_kbps)
+            NIC_TX.set(tx_kbps)
         _last_nic_counters = counters
         _last_nic_time = now
     except Exception as e:
-        print(f"[psutil-nic] Error: {e}")
+        print(f"[nic-psutil] Error: {e}")
 
 # =========================
 # BGP Session Uptime
 # =========================
+_last_bgp_check = None
+
 def parse_uptime_to_seconds(uptime_str: str) -> int:
-    """
-    Convert FRR BGP uptime formats into seconds.
-    Supports:
-      - '00:15:03'
-      - '3d12h45m'
-    Returns 0 if parsing fails.
-    """
     try:
-        if ":" in uptime_str:  # Format HH:MM:SS or MM:SS
+        if ":" in uptime_str:  # HH:MM:SS
             parts = uptime_str.split(":")
             if len(parts) == 3:
                 h, m, s = map(int, parts)
@@ -305,7 +297,7 @@ def parse_uptime_to_seconds(uptime_str: str) -> int:
             elif len(parts) == 2:
                 m, s = map(int, parts)
                 return m * 60 + s
-        else:  # Format like '3d12h45m'
+        else:  # 3d12h45m
             total = 0
             m = re.match(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?", uptime_str)
             if m:
@@ -318,11 +310,14 @@ def parse_uptime_to_seconds(uptime_str: str) -> int:
         return 0
     return 0
 
-_last_bgp_check = 0
 def update_bgp_uptime():
+    """
+    Query vtysh for BGP session summary and set Prometheus metric.
+    Updates every 5 minutes, but exposes the metric immediately on first run.
+    """
     global _last_bgp_check
     now = time.time()
-    if now - _last_bgp_check < 300:  # every 5 minutes
+    if _last_bgp_check is not None and now - _last_bgp_check < 300:
         return
     _last_bgp_check = now
 
@@ -332,16 +327,23 @@ def update_bgp_uptime():
             text=True,
             stderr=subprocess.STDOUT,
         )
+        any_set = False
         for line in output.splitlines():
-            if re.match(r"^\d+\.\d+\.\d+\.\d+", line):  # starts with neighbor IP
-                parts = line.split()
-                if len(parts) >= 9:
-                    neighbor = parts[0]
-                    uptime_str = parts[8]
-                    uptime_sec = parse_uptime_to_seconds(uptime_str)
-                    BGP_SESSION_UPTIME.labels(neighbor=neighbor).set(uptime_sec)
+            line = line.strip()
+            if not line or not re.match(r"^\d+\.\d+\.\d+\.\d+", line):
+                continue
+            parts = line.split()
+            if len(parts) >= 9:
+                neighbor = parts[0]
+                uptime_str = parts[8]
+                uptime_sec = parse_uptime_to_seconds(uptime_str)
+                BGP_SESSION_UPTIME.labels(neighbor=neighbor).set(uptime_sec)
+                any_set = True
+        if not any_set:
+            BGP_SESSION_UPTIME.labels(neighbor="none").set(0)
     except Exception as e:
         print(f"[bgp-uptime] Error: {e}")
+        BGP_SESSION_UPTIME.labels(neighbor="error").set(0)
 
 # =========================
 # Main Loop
@@ -356,7 +358,6 @@ def main():
         udp_result, udp_latency, udp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=False)
         tcp_result, tcp_latency, tcp_err = query_dns(DIRECT_DNS, DNS_TEST_RECORD, DNS_TEST_TYPE, use_tcp=True)
 
-        # Latency & accuracy
         if udp_result:
             BIND_LATENCY.set(udp_latency)
             accuracy = len(set(udp_result) & EXPECTED_IPS) / len(EXPECTED_IPS) * 100
@@ -364,13 +365,11 @@ def main():
             accuracy = 0
         BIND_RECORD_ACCURACY.set(accuracy)
 
-        # Count failures
         if udp_result is None or udp_err:
             BIND_QUERY_FAILS.inc()
         if tcp_result is None or tcp_err:
             BIND_QUERY_FAILS.inc()
 
-        # Count mismatches
         if udp_result and tcp_result:
             if set(udp_result) != set(tcp_result):
                 BIND_DIRECT_VS_BGP.set(1)
@@ -381,14 +380,18 @@ def main():
         else:
             BIND_DIRECT_VS_BGP.set(1)
             BIND_DIRECT_VS_BGP_MISMATCHES.inc()
+            BIND_QUERY_FAILS.inc()
 
-        # Update all metrics
-        update_bind_stats()
-        update_servfail_metrics()
+        if udp_err and "DNSSEC" in udp_err.upper():
+            BIND_SECURITY_ERRORS.inc()
+
+        # Update metrics
         update_system_metrics()
         update_memory_metrics()
         update_disk_metrics()
         update_nic_metrics_ifstat()
+        update_bind_stats()
+        update_servfail_metrics()
         update_bgp_uptime()
 
         time.sleep(QUERY_INTERVAL)
