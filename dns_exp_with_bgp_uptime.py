@@ -46,7 +46,6 @@ BIND_AXFR_FAILURES = Gauge("bind_axfr_failure_total", "Failed AXFR zone transfer
 BIND_SOA_REFRESH = Gauge("bind_soa_refresh_seconds", "SOA refresh timer", ["zone"])
 BIND_SOA_EXPIRY = Gauge("bind_soa_expiry_seconds", "SOA expiry timer", ["zone"])
 
-# Changed to Counter for proper Prometheus rate() usage
 BIND_QUERIES_UDP = Counter("bind_queries_udp_total", "Total DNS queries over UDP (from stats)")
 BIND_QUERIES_TCP = Counter("bind_queries_tcp_total", "Total DNS queries over TCP (from stats)")
 
@@ -263,18 +262,41 @@ def update_nic_metrics():
 # BGP Session Uptime
 # =========================
 def parse_bgp_uptime(uptime_str: str) -> int:
+    """
+    Parse BGP uptime string into seconds.
+    Supports:
+      - "1w2d3h4m"
+      - "3d12h"
+      - "03:02:19" (hh:mm:ss)
+      - "05:32"    (mm:ss)
+    """
     total = 0
     try:
+        # Handle "1w2d3h4m" style
         m = re.search(r'(\d+)w', uptime_str)
-        if m: total += int(m.group(1)) * 7 * 86400
+        if m:
+            total += int(m.group(1)) * 7 * 86400
         m = re.search(r'(\d+)d', uptime_str)
-        if m: total += int(m.group(1)) * 86400
+        if m:
+            total += int(m.group(1)) * 86400
         m = re.search(r'(\d+)h', uptime_str)
-        if m: total += int(m.group(1)) * 3600
+        if m:
+            total += int(m.group(1)) * 3600
         m = re.search(r'(\d+)m', uptime_str)
-        if m: total += int(m.group(1)) * 60
-    except Exception:
-        pass
+        if m:
+            total += int(m.group(1)) * 60
+
+        # Handle "HH:MM:SS" or "MM:SS" style
+        if total == 0 and ":" in uptime_str:
+            parts = uptime_str.split(":")
+            if len(parts) == 3:  # HH:MM:SS
+                h, m, s = map(int, parts)
+                total = h * 3600 + m * 60 + s
+            elif len(parts) == 2:  # MM:SS
+                m, s = map(int, parts)
+                total = m * 60 + s
+    except Exception as e:
+        print(f"[bgp-uptime] Parse error: {e}, input={uptime_str}")
     return total
 
 _last_bgp_check = None
@@ -289,7 +311,10 @@ def update_bgp_uptime():
             'vtysh -c "show ip bgp sum" | sed -n "9p" | awk \'{print $9}\'',
             shell=True, text=True, stderr=subprocess.STDOUT
         ).strip()
-        BGP_SESSION_UPTIME.set(parse_bgp_uptime(output))
+        seconds = parse_bgp_uptime(output)
+        BGP_SESSION_UPTIME.set(seconds)
+        if seconds == 0:
+            print(f"[bgp-uptime] Warning: parsed uptime=0 from raw='{output}'")
     except Exception as e:
         print(f"[bgp-uptime] Error: {e}")
         BGP_SESSION_UPTIME.set(0)
